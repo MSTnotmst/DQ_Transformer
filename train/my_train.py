@@ -1,8 +1,15 @@
 import time
+import os
+import datetime
 from options.train_options import TrainOptions
 from data import create_dataset
 from models import create_model
 from util.visualizer import Visualizer
+
+
+def _hms(seconds):
+    """秒數 → H:MM:SS 字串。"""
+    return str(datetime.timedelta(seconds=int(seconds)))
 
 if __name__ == '__main__':
     opt = TrainOptions().parse()  # get training options
@@ -14,6 +21,25 @@ if __name__ == '__main__':
     model.setup(opt)  # regular setup: load and print networks; create schedulers
     visualizer = Visualizer(opt)  # create a visualizer that display/save images and plots
     total_iters = 0  # the total number of training iterations
+
+    # [計時] 累計訓練時間 + ETA，寫到 checkpoints/<name>/train_time.log（append，跨續訓累積）。
+    total_epochs = opt.n_epochs + opt.n_epochs_decay
+    time_log_dir = os.path.join(opt.checkpoints_dir, opt.name)
+    os.makedirs(time_log_dir, exist_ok=True)
+    time_log_path = os.path.join(time_log_dir, 'train_time.log')
+
+    def log_time(msg):
+        print(msg)
+        with open(time_log_path, 'a') as f:
+            f.write(msg + '\n')
+
+    train_start_time = time.time()
+    log_time('=== 訓練開始 %s | 從 epoch %d 跑到 %d ===' % (
+        datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), opt.epoch_count, total_epochs))
+    if opt.epoch_count > total_epochs:
+        log_time('⚠️ 警告：--epoch_count(%d) > 總 epoch n_epochs+n_epochs_decay(%d)，'
+                 '訓練迴圈是空的、不會跑任何 epoch。續訓請把 n_epochs(+decay) 設得比 epoch_count 大。'
+                 % (opt.epoch_count, total_epochs))
 
     for epoch in range(opt.epoch_count, opt.n_epochs + opt.n_epochs_decay + 1):
         epoch_start_time = time.time()  # timer for entire epoch
@@ -57,6 +83,20 @@ if __name__ == '__main__':
             model.save_networks('latest')
             model.save_networks(epoch)
 
-        print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, opt.n_epochs + opt.n_epochs_decay,
-                                                              time.time() - epoch_start_time))
+        # [計時] 累計時間 / 平均每 epoch / 預估剩餘（ETA 以本次執行的平均速度估算）。
+        elapsed = time.time() - train_start_time
+        done = epoch - opt.epoch_count + 1
+        avg = elapsed / max(done, 1)
+        eta = avg * (total_epochs - epoch)
+        log_time('End of epoch %d/%d | 本 epoch %ds | 累計 %s | 平均 %.1fs/epoch | ETA 約 %s' % (
+            epoch, total_epochs, time.time() - epoch_start_time, _hms(elapsed), avg, _hms(eta)))
         model.update_learning_rate()  # update learning rates in the beginning of every epoch.
+
+    ran_epochs = total_epochs - opt.epoch_count + 1
+    if ran_epochs <= 0:
+        log_time('=== 結束（沒有訓練任何 epoch，見上面警告） %s ===' %
+                 datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    else:
+        log_time('=== 訓練結束 %s | 本次跑了 %d epoch | 總耗時 %s ===' % (
+            datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            ran_epochs, _hms(time.time() - train_start_time)))

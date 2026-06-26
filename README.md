@@ -1,77 +1,100 @@
-# Look, Compare and Draw: Differential Query Transformer for Automatic Oil Painting
+# DQ-Transformer · Automatic Oil Painting
 
-> [[Project Page](https://differential-query-painter.github.io/DQ-painter/)]
-> [[Paper](https://arxiv.org/abs/2603.27720)]
+> Differential Query Transformer for automatic oil painting — turn any photo into a
+> stroke-by-stroke oil painting. TVCG 2026.
+> [[Project Page](https://differential-query-painter.github.io/DQ-painter/)] · [[Paper](https://arxiv.org/abs/2603.27720)]
 
+<img src="pics/merged_output.gif" width="760" alt="stroke-by-stroke painting">
 
-This work has been accepted by *IEEE Transactions on Visualization and Computer Graphics*, 2026. 
+A transformer observes the target, compares it with the current canvas, and predicts the
+next set of brush strokes — producing expressive paintings with **fewer, less repetitive
+strokes** than prior methods.
 
-<img src="pics/merged_output.gif" width="800" alt="">
+---
 
-### Abstract
+## ✨ Improvements in this fork
 
-> This work introduces a new approach to automatic
-> oil painting that emphasizes the creation of dynamic and
-> expressive brushstrokes. A pivotal challenge lies in mitigating
-> the duplicate and common-place strokes, which often lead to less
-> aesthetic outcomes. Inspired by the human painting process, i.e.,
-> observing, comparing, and drawing, we incorporate differential
-> image analysis into a neural oil painting model, allowing the
-> model to effectively concentrate on the incremental impact
-> of successive brushstrokes. To operationalize this concept, we
-> propose the Differential Query Transformer (DQ-Transformer),
-> a new architecture that leverages differentially derived image
-> representations enriched with positional encoding to guide the
-> stroke prediction process. This integration enables the model
-> to maintain heightened sensitivity to local details, resulting in
-> more refined and nuanced stroke generation. Furthermore, we
-> incorporate adversarial training into our framework, enhancing
-> the accuracy of stroke prediction and thereby improving the
-> overall realism and fidelity of the synthesized paintings. Extensive
-> qualitative evaluations, complemented by a controlled user study,
-> validate that our DQ-Transformer surpasses existing methods in
-> both visual realism and artistic authenticity, typically achieving
-> these results with fewer strokes. The stroke-by-stroke painting
-> animations are available on our project website.
+All gated by flags; **off by default → identical to the original model.**
 
+| Flag | What it does |
+|------|--------------|
+| `--real_brush` | **Real brush textures (3A)** instead of two flat templates, **+ real stroke-parameter statistics (3C)** fitted from real strokes. One switch. |
+| `--curved_stroke` | **Curved Bézier strokes (1C)** — one token = one continuous stroke, removing the “short straight segments” look. |
 
+See `CLAUDE.md` for the full roadmap (incl. perceptual/style losses, real-painting GAN
+supervision, and global de-gridding).
 
-## Prerequisites
+---
 
-* Linux or macOS
-* Python 3.9
-* PyTorch 1.7+ and other dependencies (torchvision, visdom, dominate, and other common python libs)
+## 🚀 Quickstart (WSL2 · zsh · conda)
 
-## Training
-
-```shell
-  cd train
-  bash my_train.sh
+```zsh
+conda create -n dqp python=3.9 -y && conda activate dqp
+# install a CUDA build of torch that matches your driver (PyTorch 1.7+)
+pip install torch torchvision pillow numpy scipy visdom dominate
+nvidia-smi   # confirm the GPU is visible inside WSL
 ```
 
-* models would be saved at checkpoints/painter folder.
-
-## Inference
-
-```shell
-  cd inference
-  python inference.py
+### Inference (original)
+```zsh
+cd inference
+python inference.py            # edit input_path / model_path at the bottom of inference.py
 ```
+
+### Train (original)
+```zsh
+cd train
+bash my_train.sh              # checkpoints saved under checkpoints/painter
+```
+
+---
+
+## 🖌️ Using the improvements
+
+**1. Build a real brush library (3A)** — pick one:
+```zsh
+python tools/setup_brushes.py --synthesize 64          # starter set from built-ins
+python tools/setup_brushes.py --src /path/to/brushes   # import a real dataset
+```
+
+**2. (Optional) Fit real stroke statistics (3C):**
+```zsh
+python tools/fit_strokes.py --src /path/to/single_strokes              # straight
+python tools/fit_strokes.py --src /path/to/single_strokes --curved     # curved
+```
+
+**3. Train with the features:**
+```zsh
+cd train
+# 3A + 3C
+python my_train.py --name painter_real --model painter --dataset_mode null \
+  --gpu_ids 0 --batch_size 128 --max_dataset_size 256 --real_brush
+
+# 1C (curved strokes)
+python my_train.py --name painter_curved --model painter --dataset_mode null \
+  --gpu_ids 0 --batch_size 128 --max_dataset_size 256 --curved_stroke
+
+# combined
+python my_train.py --name painter_full --model painter --dataset_mode null \
+  --gpu_ids 0 --batch_size 128 --max_dataset_size 256 --real_brush --curved_stroke
+```
+
+**4. Inference with the features** — edit the `main(...)` call at the bottom of
+`inference/inference.py` and set `real_brush=True` and/or `curved_stroke=True`
+(`curved_stroke` requires a checkpoint trained with `--curved_stroke`).
+
+---
+
 ## Citation
-
-If you find this code helpful for your research, please cite:
-
-```
+```bibtex
 @article{liu2026look,
-author = "Liu, Lingyu and Wang, Yaxiong and Zhu, Li and Liao, Lizi and Zheng, Zhedong",
-title = "Look, Compare and Draw: Differential Query Transformer for Automatic Oil Painting",
-journal = "TVCG",
-code = "https://differential-query-painter.github.io/DQ-painter/",
-year = "2026" }
+  author  = "Liu, Lingyu and Wang, Yaxiong and Zhu, Li and Liao, Lizi and Zheng, Zhedong",
+  title   = "Look, Compare and Draw: Differential Query Transformer for Automatic Oil Painting",
+  journal = "TVCG",
+  year    = "2026"
+}
 ```
 
 ## Acknowledgments
-
-This repository is benefit from [Paint Transformer](https://github.com/Huage001/PaintTransformer). Thanks for the
-open-sourcing work! We would also like to thank to the great projects
-in [Compositional Neural Painter](https://github.com/sjtuplayer/Compositional_Neural_Painter).
+Built on [Paint Transformer](https://github.com/Huage001/PaintTransformer) and
+[Compositional Neural Painter](https://github.com/sjtuplayer/Compositional_Neural_Painter).

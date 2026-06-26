@@ -1,0 +1,12 @@
+# 訓練 checkpoint（很大、在 cglab 自己生、另外 rsync）
+*.pth
+# Python bytecode
+__pycache__/
+*.pyc
+# inference
+inference/output/
+inference/brush/
+
+# train
+train/checkpoints/
+checkpoints/

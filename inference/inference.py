@@ -4,11 +4,27 @@ import numpy as np
 from PIL import Image
 import network
 import morphology
+import stroke_render
 import os
 import math
 
 
-# idx = 0
+idx = 0
+
+# Set in main(); keep stroke rendering consistent with training gates.
+CURVED = False        # 1C: curved (Bezier) strokes
+REAL_BRUSH = False    # 3A: sample textures from brush/real/*.png
+
+
+def postprocess_param(param):
+    """Map raw network output into in-patch stroke ranges (centred + shrunk)."""
+    if CURVED:
+        param[..., :6] = param[..., :6] / 2 + 0.25   # 3 control points -> [0.25, 0.75]
+        param[..., 6:7] = param[..., 6:7].abs() / 2   # width
+    else:
+        param[..., :2] = param[..., :2] / 2 + 0.25
+        param[..., 2:4] = param[..., 2:4] / 2
+    return param
 
 
 def save_img(img, output_path):
@@ -32,6 +48,12 @@ def param2stroke(param, H, W, meta_brushes):
         alphas: a tensor with shape n_strokes x 3 x H x W,
          containing binary information of whether a pixel is belonging to the stroke (alpha mat), for painting process.
     """
+    # 1C: curved strokes use a separate differentiable renderer.
+    if CURVED:
+        foreground, alphas = stroke_render.render_curved(param, H, W, color_gradient=False)
+        foreground = morphology.dilation(foreground)
+        alphas = morphology.erosion(alphas)
+        return foreground, alphas
     # Firstly, resize the meta brushes to the required shape,
     # in order to decrease GPU memory especially when the required shape is small.
     meta_brushes_resize = F.interpolate(meta_brushes, (H, W))
@@ -45,9 +67,13 @@ def param2stroke(param, H, W, meta_brushes):
     cos_theta = torch.cos(torch.acos(torch.tensor(-1., device=param.device)) * theta)
     # index means each stroke should use which meta stroke? Vertical meta stroke or horizontal meta stroke.
     # When h > w, vertical stroke should be used. When h <= w, horizontal stroke should be used.
-    index = torch.full((b,), -1, device=param.device, dtype=torch.long)
-    index[h > w] = 0
-    index[h <= w] = 1
+    if REAL_BRUSH:
+        # 3A: orientation handled by theta, so pick a real brush texture at random.
+        index = torch.randint(0, meta_brushes_resize.shape[0], (b,), device=param.device)
+    else:
+        index = torch.full((b,), -1, device=param.device, dtype=torch.long)
+        index[h > w] = 0
+        index[h <= w] = 1
     brush = meta_brushes_resize[index.long()]
 
     # Calculate warp matrix according to the rules defined by pytorch, in order for warping.
@@ -242,7 +268,9 @@ def param2img_parallel(param, decision, meta_brushes, cur_canvas):
     # param: b, h, w, stroke_per_patch, param_per_stroke
     # decision: b, h, w, stroke_per_patch
     b, h, w, s, p = param.shape
-    param = param.view(-1, 8).contiguous()
+    # [B3] 原本寫死 view(-1, 8) 只對 straight（param_dim=8）成立；curved 是 10 維會壞掉。
+    #      改用實際 param_dim p，straight/curved 都正確。
+    param = param.view(-1, p).contiguous()
     decision = decision.view(-1).contiguous().bool()
     H, W = cur_canvas.shape[-2:]
     is_odd_y = h % 2 == 1
@@ -375,7 +403,10 @@ def crop(img, h, w):
 
 
 def main(input_path, model_path, output_dir, need_animation=False, resize_h=None, resize_w=None, serial=False,
-         gpu_id=0):
+         gpu_id=0, real_brush=False, curved_stroke=False, brush_dir='brush'):
+    global CURVED, REAL_BRUSH
+    CURVED = curved_stroke
+    REAL_BRUSH = real_brush
     if not os.path.exists(output_dir):
         os.mkdir(output_dir)
     input_name = os.path.basename(input_path)
@@ -390,17 +421,17 @@ def main(input_path, model_path, output_dir, need_animation=False, resize_h=None
             os.mkdir(frame_dir)
     patch_size = 32
     stroke_num = 8
+    param_per_stroke = 7 if CURVED else 5          # shape dims the net predicts
+    param_dim = param_per_stroke + 3               # + sampled RGB
     device = torch.device('cuda:{}'.format(gpu_id) if torch.cuda.is_available() else "cpu")
-    net_g = network.Painter(5, stroke_num, 256, 8, 3, 3, device=device).to(device)
+    net_g = network.Painter(param_per_stroke, stroke_num, 256, 8, 3, 3, device=device).to(device)
     net_g.load_state_dict(torch.load(model_path))
     net_g.eval()
     for param in net_g.parameters():
         param.requires_grad = False
 
-    brush_large_vertical = read_img('brush/brush_large_vertical.png', 'L').to(device)
-    brush_large_horizontal = read_img('brush/brush_large_horizontal.png', 'L').to(device)
-    meta_brushes = torch.cat(
-        [brush_large_vertical, brush_large_horizontal], dim=0)
+    # 3A: built-in templates, or real brush textures from <brush_dir>/real/*.png.
+    meta_brushes = stroke_render.load_meta_brushes(brush_dir, device, real_brush=REAL_BRUSH)
 
     with torch.no_grad():
         original_img = read_img(input_path, 'RGB', resize_h, resize_w).to(device)
@@ -435,12 +466,11 @@ def main(input_path, model_path, output_dir, need_animation=False, resize_h=None
             stroke_param = torch.cat([shape_param, color], dim=-1)
             # stroke_param: b * h * w, stroke_per_patch, param_per_stroke
             # stroke_decision: b * h * w, stroke_per_patch, 1
-            param = stroke_param.view(1, patch_num, patch_num, stroke_num, 8).contiguous()
+            param = stroke_param.view(1, patch_num, patch_num, stroke_num, param_dim).contiguous()
             decision = stroke_decision.view(1, patch_num, patch_num, stroke_num).contiguous().bool()
-            # param: b, h, w, stroke_per_patch, 8
+            # param: b, h, w, stroke_per_patch, param_dim
             # decision: b, h, w, stroke_per_patch
-            param[..., :2] = param[..., :2] / 2 + 0.25
-            param[..., 2:4] = param[..., 2:4] / 2
+            param = postprocess_param(param)
             if serial:
                 final_result = param2img_serial(param, decision, meta_brushes, final_result,
                                                 frame_dir, False, original_h, original_w)
@@ -472,12 +502,11 @@ def main(input_path, model_path, output_dir, need_animation=False, resize_h=None
         stroke_param = torch.cat([shape_param, color], dim=-1)
         # stroke_param: b * h * w, stroke_per_patch, param_per_stroke
         # stroke_decision: b * h * w, stroke_per_patch, 1
-        param = stroke_param.view(1, h, w, stroke_num, 8).contiguous()
+        param = stroke_param.view(1, h, w, stroke_num, param_dim).contiguous()
         decision = stroke_decision.view(1, h, w, stroke_num).contiguous().bool()
-        # param: b, h, w, stroke_per_patch, 8
+        # param: b, h, w, stroke_per_patch, param_dim
         # decision: b, h, w, stroke_per_patch
-        param[..., :2] = param[..., :2] / 2 + 0.25
-        param[..., 2:4] = param[..., 2:4] / 2
+        param = postprocess_param(param)
         if serial:
             final_result = param2img_serial(param, decision, meta_brushes, final_result,
                                             frame_dir, True, original_h, original_w)
@@ -490,11 +519,14 @@ def main(input_path, model_path, output_dir, need_animation=False, resize_h=None
 
 
 if __name__ == '__main__':
-    main(input_path='',
-         model_path='./painter.pth',
+    main(input_path='../pics/cute_ala.jpg',
+         model_path='../train/checkpoint/painter_3A_real/latest_net_g.pth',
          output_dir='output/',
          need_animation=False,  # whether need intermediate results for animation.
-         resize_h=512,  # resize original input to this size. None means do not resize.
-         resize_w=512,  # resize original input to this size. None means do not resize.
-         serial=False,
-         gpu_id=0)  # if need animation, serial must be True.
+         resize_h=2048,  # resize original input to this size. None means do not resize.
+         resize_w=2048,  # resize original input to this size. None means do not resize.
+         serial=True,
+         gpu_id=0,  # if need animation, serial must be True.
+         real_brush=False,    # 3A: sample real brush textures from brush/real/*.png
+         curved_stroke=False,  # 1C: needs a checkpoint trained with --curved_stroke
+         brush_dir='brush')

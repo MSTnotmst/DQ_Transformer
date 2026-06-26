@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from .base_model import BaseModel
@@ -6,6 +7,7 @@ from util import morphology
 from scipy.optimize import linear_sum_assignment
 from PIL import Image
 from . import wgan
+from . import stroke_render
 from torch.autograd import Variable
 
 
@@ -31,6 +33,18 @@ class PainterModel(BaseModel):
         parser.add_argument('--lambda_gt', type=float, default=1.0, help='weight for ground-truth loss')
         parser.add_argument('--lambda_decision', type=float, default=1.0, help='weight for stroke decision loss')
         parser.add_argument('--lambda_recall', type=float, default=10.0, help='weight of recall for stroke decision loss')
+        # ---- improvement flags ----------------------------------------------------
+        # 3A + 3C share one gate: real brush textures + real stroke-param distribution.
+        parser.add_argument('--real_brush', action='store_true',
+                            help='[3A+3C] use real brush textures (brush/real/*.png) and, if available, '
+                                 'real stroke-parameter statistics (--real_params).')
+        parser.add_argument('--brush_dir', type=str, default='brush',
+                            help='directory holding brush templates; real textures go in <brush_dir>/real/.')
+        parser.add_argument('--real_params', type=str, default='brush/real_params.npy',
+                            help='[3C] .npy of fitted real stroke shape params; ignored if missing.')
+        # 1C is an independent gate: curved (quadratic-Bezier) strokes.
+        parser.add_argument('--curved_stroke', action='store_true',
+                            help='[1C] generate/predict continuous curved (Bezier) strokes instead of straight ones.')
         return parser
 
     def __init__(self, opt):
@@ -38,22 +52,37 @@ class PainterModel(BaseModel):
         self.loss_names = ['pixel', 'gt', 'w', 'decision', "decision_sum", "gan", "D_fake", "D_real", "G", "D"]
         self.visual_names = ['old', 'render', 'rec']
         self.model_names = ['g']
-        self.d = 12  # xc, yc, w, h, theta, R0, G0, B0, R2, G2, B2, A
-        self.d_shape = 5
 
-        def read_img(img_path, img_type='RGB'):
-            img = Image.open(img_path).convert(img_type)
-            img = np.array(img)
-            if img.ndim == 2:
-                img = np.expand_dims(img, axis=-1)
-            img = img.transpose((2, 0, 1))
-            img = torch.from_numpy(img).unsqueeze(0).float() / 255.
-            return img
+        # --- improvement gates -------------------------------------------------
+        self.curved = bool(getattr(opt, 'curved_stroke', False))      # 1C
+        self.real_brush = bool(getattr(opt, 'real_brush', False))     # 3A (+3C)
+        if self.curved:
+            # x0,y0,x1,y1,x2,y2,w, R0,G0,B0,R2,G2,B2, A
+            self.d = 14
+            self.d_shape = 7
+        else:
+            # xc, yc, w, h, theta, R0, G0, B0, R2, G2, B2, A
+            self.d = 12
+            self.d_shape = 5
 
-        brush_large_vertical = read_img('brush/brush_large_vertical.png', 'L').to(self.device)
-        brush_large_horizontal = read_img('brush/brush_large_horizontal.png', 'L').to(self.device)
-        self.meta_brushes = torch.cat(
-            [brush_large_vertical, brush_large_horizontal], dim=0)
+        # 3A: load brush library (built-in 2 templates, or brush/real/*.png).
+        self.meta_brushes = stroke_render.load_meta_brushes(
+            getattr(opt, 'brush_dir', 'brush'), self.device, real_brush=self.real_brush)
+
+        # 3C: optional real stroke shape-parameter pool (overrides random shapes).
+        self.real_params = None
+        if self.real_brush:
+            rp_path = getattr(opt, 'real_params', 'brush/real_params.npy')
+            if rp_path and os.path.isfile(rp_path):
+                arr = np.load(rp_path).astype(np.float32)
+                if arr.shape[1] == self.d_shape:
+                    self.real_params = torch.from_numpy(arr).to(self.device)
+                    print('[painter_model] 3C: loaded %d real stroke params from %s' % (arr.shape[0], rp_path))
+                else:
+                    print('[painter_model] 3C: %s has dim %d but expected %d; ignoring.'
+                          % (rp_path, arr.shape[1], self.d_shape))
+            else:
+                print('[painter_model] 3C: %s not found; using random stroke shapes.' % rp_path)
         net_g = networks.Painter(self.d_shape, opt.used_strokes, opt.ngf,
                                  n_enc_layers=opt.num_blocks, n_dec_layers=opt.num_blocks, device=self.device)
         self.net_g = networks.init_net(net_g, opt.init_type, opt.init_gain, self.gpu_ids)
@@ -87,7 +116,13 @@ class PainterModel(BaseModel):
         self.critic = wgan.Wgan(input_dim=3, dataset_inside=False, device=self.device)
         self.loss_gan = torch.tensor(0., device=self.device)
 
-    def param2stroke(self, param, H, W):
+    def render_strokes(self, param, H, W):
+        """Dispatch to the curved (1C) or straight renderer based on the gate."""
+        if self.curved:
+            return stroke_render.render_curved(param, H, W, color_gradient=True)
+        return self.param2stroke(param, H, W, rand_index=self.real_brush)
+
+    def param2stroke(self, param, H, W, rand_index=False):
         # param: b, 12
         b = param.shape[0]
         param_list = torch.split(param, 1, dim=1)
@@ -95,9 +130,13 @@ class PainterModel(BaseModel):
         R0, G0, B0, R2, G2, B2, _ = param_list[5:]
         sin_theta = torch.sin(torch.acos(torch.tensor(-1., device=param.device)) * theta)
         cos_theta = torch.cos(torch.acos(torch.tensor(-1., device=param.device)) * theta)
-        index = torch.full((b,), -1, device=param.device)
-        index[h > w] = 0
-        index[h <= w] = 1
+        if rand_index:
+            # 3A: orientation is handled by theta, so pick a real brush at random.
+            index = torch.randint(0, self.meta_brushes.shape[0], (b,), device=param.device)
+        else:
+            index = torch.full((b,), -1, device=param.device)
+            index[h > w] = 0
+            index[h <= w] = 1
         brush = self.meta_brushes[index.long()]
         alphas = torch.cat([brush, brush, brush], dim=1)
         alphas = (alphas > 0).float()
@@ -121,14 +160,34 @@ class PainterModel(BaseModel):
 
         return brush, alphas
 
+    def _random_params(self, n_groups):
+        """Sample random stroke params in sensible ranges (straight or curved)."""
+        p = torch.rand(n_groups, self.opt.used_strokes, self.d, device=self.device)
+        if self.curved:
+            p[:, :, :6] = p[:, :, :6] * 0.7 + 0.15   # 3 control points in [0.15, 0.85]
+            p[:, :, 6] = p[:, :, 6] * 0.27 + 0.08    # width in [0.08, 0.35]
+        else:
+            p[:, :, :4] = p[:, :, :4] * 0.5 + 0.2    # xc, yc, w, h in [0.2, 0.7]
+        p[:, :, -4:-1] = p[:, :, -7:-4]              # copy start colour to end colour
+        return p
+
+    def _apply_real_shapes(self, gt_param):
+        """3C: replace the random shape part with samples from real stroke stats."""
+        if self.real_params is None:
+            return gt_param
+        n = gt_param.shape[0] * gt_param.shape[1]
+        idx = torch.randint(0, self.real_params.shape[0], (n,), device=self.device)
+        sampled = self.real_params[idx].view(gt_param.shape[0], gt_param.shape[1], self.d_shape)
+        gt_param = gt_param.clone()
+        gt_param[:, :, :self.d_shape] = sampled
+        return gt_param
+
     def set_input(self, input_dict):
         self.image_paths = input_dict['A_paths']
         with torch.no_grad():
-            old_param = torch.rand(self.opt.batch_size // 4, self.opt.used_strokes, self.d, device=self.device)
-            old_param[:, :, :4] = old_param[:, :, :4] * 0.5 + 0.2
-            old_param[:, :, -4:-1] = old_param[:, :, -7:-4]
+            old_param = self._random_params(self.opt.batch_size // 4)
             old_param = old_param.view(-1, self.d).contiguous()
-            foregrounds, alphas = self.param2stroke(old_param, self.patch_size * 2, self.patch_size * 2)
+            foregrounds, alphas = self.render_strokes(old_param, self.patch_size * 2, self.patch_size * 2)
             foregrounds = morphology.Dilation2d(m=1)(foregrounds)
             alphas = morphology.Erosion2d(m=1)(alphas)
             foregrounds = foregrounds.view(self.opt.batch_size // 4, self.opt.used_strokes, 3, self.patch_size * 2,
@@ -144,12 +203,11 @@ class PainterModel(BaseModel):
             old = old.permute(0, 2, 4, 1, 3, 5).contiguous()
             self.old = old.view(self.opt.batch_size, 3, self.patch_size, self.patch_size).contiguous()
 
-            gt_param = torch.rand(self.opt.batch_size, self.opt.used_strokes, self.d, device=self.device)
-            gt_param[:, :, :4] = gt_param[:, :, :4] * 0.5 + 0.2
-            gt_param[:, :, -4:-1] = gt_param[:, :, -7:-4]
+            gt_param = self._random_params(self.opt.batch_size)
+            gt_param = self._apply_real_shapes(gt_param)   # 3C (no-op if no real_params)
             self.gt_param = gt_param[:, :, :self.d_shape]
             gt_param = gt_param.view(-1, self.d).contiguous()
-            foregrounds, alphas = self.param2stroke(gt_param, self.patch_size, self.patch_size)
+            foregrounds, alphas = self.render_strokes(gt_param, self.patch_size, self.patch_size)
             foregrounds = morphology.Dilation2d(m=1)(foregrounds)
             alphas = morphology.Erosion2d(m=1)(alphas)
             foregrounds = foregrounds.view(self.opt.batch_size, self.opt.used_strokes, 3, self.patch_size,
@@ -177,7 +235,7 @@ class PainterModel(BaseModel):
         self.pred_decision = decisions.view(-1, self.opt.used_strokes).contiguous()
         self.pred_param = param[:, :, :self.d_shape]
         param = param.view(-1, self.d).contiguous()
-        foregrounds, alphas = self.param2stroke(param, self.patch_size, self.patch_size)
+        foregrounds, alphas = self.render_strokes(param, self.patch_size, self.patch_size)
         foregrounds = morphology.Dilation2d(m=1)(foregrounds)
         alphas = morphology.Erosion2d(m=1)(alphas)
         foregrounds = foregrounds.view(-1, self.opt.used_strokes, 3, self.patch_size, self.patch_size)
@@ -228,10 +286,21 @@ class PainterModel(BaseModel):
             trace_12[..., 0, 0] * trace_12[..., 1, 1] - trace_12[..., 0, 1] * trace_12[..., 1, 0]))
         return torch.sum((mu_1 - mu_2) ** 2, dim=-1) + trace_1 + trace_2 - 2 * trace_12
 
+    def _shape_w_distance(self, p1, p2):
+        """Shape-aware distance: Gaussian-Wasserstein for straight strokes,
+        control-point L2 for curved strokes (1C)."""
+        if self.curved:
+            return ((p1[..., :6] - p2[..., :6]) ** 2).sum(dim=-1)
+        return self.gaussian_w_distance(p1, p2)
+
     def optimize_parameters(self, epoch):
         self.forward()
         self.loss_pixel = self.criterion_pixel(self.rec, self.render)
-        self.loss_decision_sum = torch.norm(self.pred_decision, p=1, dim=1).sum() / self.opt.batch_size * 0.1
+        # decision_sum 是 logit 的 L1 稀疏懲罰，強度隨筆數 N 線性放大；原版 N=8 調好的 0.1，
+        # 在全域 N=400 會強 ~50 倍把 decision logit 全壓成 0（head 塌縮、學不出去留）。
+        # 用 decision_sum_coeff 讓「每筆」壓力與原版一致（原版預設 0.1 不變；全域設 0.1*8/N）。
+        ds_coeff = getattr(self, 'decision_sum_coeff', 0.1)
+        self.loss_decision_sum = torch.norm(self.pred_decision, p=1, dim=1).sum() / self.opt.batch_size * ds_coeff
         cur_valid_gt_size = 0
         with torch.no_grad():
             r_idx = []
@@ -244,16 +313,22 @@ class PainterModel(BaseModel):
                     1, valid_gt_param.shape[0], 1)
                 valid_gt_param_broad = valid_gt_param.unsqueeze(0).contiguous().repeat(
                     self.pred_param.shape[1], 1, 1)
-                cost_matrix_w = self.gaussian_w_distance(pred_param_broad.to(torch.float32), valid_gt_param_broad.to(torch.float32))
+                cost_matrix_w = self._shape_w_distance(pred_param_broad.to(torch.float32), valid_gt_param_broad.to(torch.float32))
                 decision = self.pred_decision[i]
                 cost_matrix_decision = (1 - decision).unsqueeze(-1).repeat(1, valid_gt_param.shape[0])
-                r, c = linear_sum_assignment((cost_matrix_l1 + cost_matrix_w + cost_matrix_decision).to(torch.float32).cpu())
+                cost = (cost_matrix_l1 + cost_matrix_w + cost_matrix_decision).to(torch.float32)
+                # 防呆：cost 若含 NaN/Inf 會讓 linear_sum_assignment 報錯；用大有限值取代（有限值時 no-op）。
+                cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
+                r, c = linear_sum_assignment(cost.cpu())
                 r_idx.append(torch.tensor(r + self.pred_param.shape[1] * i, device=self.device))
                 c_idx.append(torch.tensor(c + cur_valid_gt_size, device=self.device))
                 cur_valid_gt_size += valid_gt_param.shape[0]
             r_idx = torch.cat(r_idx, dim=0)
             c_idx = torch.cat(c_idx, dim=0)
-            paired_gt_decision = torch.zeros(self.gt_decision.shape[0] * self.gt_decision.shape[1], device=self.device)
+            # paired_gt_decision 是「每個預測」的決策標籤（要對 all_pred_decision 算 loss），
+            # 故尺寸須為預測數 b*N，而非 GT 數 b*M。原版 N==M 兩者相等故無差；
+            # 全域(1B) N!=M 時必須用預測尺寸，否則 r_idx（預測空間）會越界。
+            paired_gt_decision = torch.zeros(self.pred_decision.shape[0] * self.pred_decision.shape[1], device=self.device)
             paired_gt_decision[r_idx] = 1.
         all_valid_gt_param = self.gt_param[self.gt_decision.bool(), :]
         all_pred_param = self.pred_param.view(-1, self.pred_param.shape[2]).contiguous()
@@ -261,12 +336,14 @@ class PainterModel(BaseModel):
         paired_gt_param = all_valid_gt_param[c_idx, :]
         paired_pred_param = all_pred_param[r_idx, :]
         self.loss_gt = self.criterion_pixel(paired_pred_param, paired_gt_param)
-        self.loss_w = self.gaussian_w_distance(paired_pred_param, paired_gt_param).mean()
+        self.loss_w = self._shape_w_distance(paired_pred_param, paired_gt_param).mean()
         self.loss_decision = self.criterion_decision(all_pred_decision, paired_gt_decision)
         loss = (self.loss_pixel * self.opt.lambda_pixel + self.loss_gt * self.opt.lambda_gt + self.loss_w * self.opt.lambda_w
                 + self.loss_decision * self.opt.lambda_decision + self.loss_decision_sum)
 
-        if epoch > 200:
+        # WGAN critic 寫死 32×32 patch（wgan.py 的 dim=32），對全域整張圖無意義，
+        # 故全域(1B)模型以 self.use_critic=False 關閉；原版預設 True 不變。
+        if epoch > 200 and getattr(self, 'use_critic', True):
             D_fake, D_real, gradient_penalty = self.critic.update(Variable(self.rec), Variable(self.render))
             self.loss_D_fake = round(float(D_fake.detach()), 4)
             self.loss_D_real = round(float(D_real.detach()), 4)
@@ -280,7 +357,9 @@ class PainterModel(BaseModel):
 
         self.loss_G = loss
         self.optimizer.zero_grad()
-        loss.backward(retain_graph=True)
+        # retain_graph 預設 True（原版行為不變）；全域(1B)模型單張圖巨大，留圖會跨 iter 累積
+        # 致 OOM，故由子類設 self.retain_graph=False 關閉。
+        loss.backward(retain_graph=getattr(self, 'retain_graph', True))
         self.optimizer.step()
 
     # def test_one_iter(self):
