@@ -10,3 +10,7 @@ inference/brush/
 # train
 train/checkpoints/
 checkpoints/
+
+.claude
+AGENTS.md
+CLAUDE.md
