@@ -284,7 +284,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     if args.out_name:
         name = args.out_name
-        if not os.path.splitext(name)[1]:        # 沒副檔名就補 .jpg
+        if not os.path.splitext(name)[1]:
             name += '.jpg'
     else:
         name = os.path.basename(args.input)

@@ -269,17 +269,16 @@ class PainterGlobal(nn.Module):
         else:        # straight: [xc,yc, w(長軸), h(短軸), theta]
             xy = torch.sigmoid(param[..., :2])
             if self.coarse_to_fine:
-                # [B] 尺度排程：sc=0 → 細筆做細節（眼/鼻/紋路）；sc=1 → 粗筆鋪底。
-                #   長軸 w: [0.01,0.25] → [0.30,0.85]；短軸 h: [0.008,0.08] → [0.20,0.50]。
-                #   細端下界調小（原 0.02/0.015）讓模型能下小筆畫細節；上界也收小，
-                #   讓細 pass 真的只做精修、不再用中大筆把小特徵蓋掉。下界隨 sc 抬高 → 粗 pass 強制大筆鋪底。
-                w_lo = 0.01 + 0.29 * sc; w_hi = 0.25 + 0.60 * sc
-                h_lo = 0.008 + 0.192 * sc; h_hi = 0.08 + 0.42 * sc
+                # [B] 尺度排程：sc=0 → 細筆做細節；sc=1 → 粗筆鋪底。
+                #   長軸 w: [0.02,0.47] → [0.30,0.85]；短軸 h: [0.015,0.125] → [0.20,0.50]。
+                #   下界隨 sc 抬高 → 粗 pass 強制大筆鋪底。
+                w_lo = 0.02 + 0.28 * sc; w_hi = 0.47 + 0.38 * sc
+                h_lo = 0.015 + 0.185 * sc; h_hi = 0.125 + 0.375 * sc
                 w_len = torch.sigmoid(param[..., 2:3]) * (w_hi - w_lo) + w_lo
                 h_wid = torch.sigmoid(param[..., 3:4]) * (h_hi - h_lo) + h_lo
             else:
-                w_len = torch.sigmoid(param[..., 2:3]) * 0.24 + 0.01    # 長軸 [0.01,0.25]（與 c2f sc=0 一致）
-                h_wid = torch.sigmoid(param[..., 3:4]) * 0.072 + 0.008  # 短軸 [0.008,0.08]
+                w_len = torch.sigmoid(param[..., 2:3]) * 0.45 + 0.02    # 長軸 [0.02,0.47]（與 c2f sc=0 一致）
+                h_wid = torch.sigmoid(param[..., 3:4]) * 0.11 + 0.015   # 短軸 [0.015,0.125]
             th = torch.sigmoid(param[..., 4:5])
             param = torch.cat([xy, w_len, h_wid, th], dim=-1)
 
