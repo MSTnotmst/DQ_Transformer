@@ -30,6 +30,66 @@ import stroke_render
 import inference as base  # 借用 read_img / save_img
 
 
+def _load_letterbox(path, res):
+    """載圖並 letterbox-pad 成 res×res 正方形（保持原始比例，不拉伸）。
+
+    Returns:
+        img  : (1,3,res,res) tensor in [0,1]
+        crop : (y1, x1, y2, x2) — 有效像素區域，用於推論後裁回原始比例存檔。
+    """
+    img_pil = Image.open(path).convert('RGB')
+    orig_w, orig_h = img_pil.size
+    scale = res / max(orig_w, orig_h)
+    new_w, new_h = round(orig_w * scale), round(orig_h * scale)
+    img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
+    pad = Image.new('RGB', (res, res), (0, 0, 0))
+    off_x, off_y = (res - new_w) // 2, (res - new_h) // 2
+    pad.paste(img_pil, (off_x, off_y))
+    img = torch.from_numpy(np.array(pad).transpose(2, 0, 1)).float().unsqueeze(0) / 255.
+    return img, (off_y, off_x, off_y + new_h, off_x + new_w)
+
+
+def _orient_field(img):
+    """計算每個像素的沿邊方向 theta ∈ [0,1]（0=水平、0.5=垂直）。
+
+    用結構張量（Sobel + 局部平均）求主要邊緣方向，可引導筆觸沿著樹皮/毛髮走。
+    img: (1,3,H,W)  →  (1,1,H,W)
+    """
+    gray = img.mean(dim=1, keepdim=True)
+    device, dtype = img.device, img.dtype
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                      device=device, dtype=dtype).view(1, 1, 3, 3) / 8.0
+    ky = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]],
+                      device=device, dtype=dtype).view(1, 1, 3, 3) / 8.0
+    gx = F.conv2d(gray, kx, padding=1)
+    gy = F.conv2d(gray, ky, padding=1)
+    # 局部平均結構張量分量（9×9 窗口）
+    J11 = F.avg_pool2d(gx * gx, 9, stride=1, padding=4)
+    J12 = F.avg_pool2d(gx * gy, 9, stride=1, padding=4)
+    J22 = F.avg_pool2d(gy * gy, 9, stride=1, padding=4)
+    # 梯度方向（垂直於邊緣）→ 沿邊方向 = 梯度 + π/2
+    theta_grad = 0.5 * torch.atan2(2 * J12, J11 - J22 + 1e-8)
+    return ((theta_grad + math.pi / 2) % math.pi) / math.pi  # (1,1,H,W) ∈ [0,1]
+
+
+def _apply_orient(img, param, blend):
+    """把結構張量沿邊方向混入預測的 theta（param[:,:,4]）。
+
+    blend=0.0 → 純模型預測；blend=1.0 → 完全跟邊緣方向；建議 0.5~0.8。
+    """
+    if blend <= 0.0:
+        return param
+    orient = _orient_field(img)                               # (1,1,H,W)
+    xc, yc = param[:, :, 0], param[:, :, 1]                  # (1,N)
+    grid = torch.stack([xc * 2 - 1, yc * 2 - 1], dim=-1).unsqueeze(2)  # (1,N,1,2)
+    sampled = F.grid_sample(orient, grid, align_corners=False,
+                            mode='bilinear', padding_mode='border')      # (1,1,N,1)
+    sampled = sampled.squeeze(1).squeeze(-1)                  # (1,N)
+    param = param.clone()
+    param[:, :, 4] = (1.0 - blend) * param[:, :, 4] + blend * sampled
+    return param
+
+
 def _to_pil(canvas, max_side=None):
     """(1,3,R,R) tensor → PIL Image（uint8 RGB），可選把長邊縮到 max_side 控制 GIF 大小。"""
     arr = (canvas[0].clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
@@ -104,7 +164,8 @@ def render_strokes_global(param, H, W, meta_brushes, real_brush, curved):
 @torch.no_grad()
 def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, chunk,
          keep_all=False, decision_thresh=0.0, soft_decision=False, stop_delta=0.0015,
-         gif_path=None, gif_fps=2, gif_max=512):
+         gif_path=None, gif_fps=2, gif_max=512, orient_blend=0.0, blur_init=False,
+         blur_sigma=16, min_scale=0.0, ramp_frac=0.5):
     """[金字塔] 全域 coarse-to-fine：低解析度起步、逐層升 res，每層在殘差上補筆精修。
 
     每層**全域**（整張圖一次 forward、無 patch、無棋盤 → 去格保住）；逐層升解析度 → 高層看
@@ -114,6 +175,11 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
     levels   : 金字塔層數（建議 = 訓練的 --steps）；解析度 R/2^(levels-1)…R 逐層加倍、下界 64。
     passes   : 每層精修趟數上限（某趟畫面變化 < stop_delta 就提早進下一層）。
     keep_all / decision_thresh / soft_decision : decision 模式（同前；keep_all 診斷全畫）。
+    min_scale: [筆觸下限] scale 的下限（0=原行為，可到最小筆觸界）。點狀筆觸多半是 pass 太少
+               造成（少數孤立小筆看起來像點；夠多趟會累積成紋理），優先加 passes 而非拉高 min_scale。
+    ramp_frac: [單解析度模式，levels==1] scale 由粗漸細所佔的 pass 比例（前 ramp_frac 趟 1.0→min_scale、
+               之後停在 min_scale 繼續精修）。levels==1 才生效，複製 cute_ala_500 的「單解析度 + 數百趟
+               回饋精修」機制：一路穿過粗鋪底 → 逐趟在殘差上補更小筆 → 累積出細節。levels>1 = 金字塔模式。
     """
     device = img_full.device
     res_list = [max(R // (2 ** (levels - 1 - i)), 64) for i in range(levels)]
@@ -125,16 +191,25 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
         return _to_pil(c, gif_max)
     frames = [gframe(canvas)] if gif_path else None
 
+    single_scale = (levels == 1)                     # [參考機制] 單解析度 + scale 隨 pass ramp
+    ramp_end = max(1, int(passes * ramp_frac))       #   前 ramp_frac 趟粗→細，之後停在 min_scale
     for li, res in enumerate(res_list):
         img_L = F.interpolate(img_full, (res, res), mode='area') if res < R else img_full
         if canvas.shape[-1] != res:                  # 上層結果升採樣帶到本層
             canvas = F.interpolate(canvas, (res, res), mode='bilinear', align_corners=False)
-        scale = 1.0 - li / max(1, levels - 1)        # 低層粗(1.0) → 高層細(0.0)，與訓練同
+        raw_level = 1.0 - li / max(1, levels - 1)    # 金字塔：ramp 綁層（粗 1.0 → 細 0.0）
         for p in range(passes):
+            if single_scale:                         # 單解析度：scale 隨 pass 由粗漸細（複製 cute_ala_500 機制）
+                raw = max(0.0, 1.0 - p / ramp_end)
+            else:
+                raw = raw_level
+            scale = min_scale + (1.0 - min_scale) * raw  # [筆觸下限] 收在 min_scale 不歸 0
             prev = canvas
             cha = img_L - canvas
             resid = cha.abs().mean().item()
             param, decision, _ = net(img_L, canvas, cha, scale=scale)
+            if orient_blend > 0.0:
+                param = _apply_orient(img_L, param, orient_blend)
             N, d = param.shape[1], param.shape[2]
             logit = decision.view(1, N)
             if keep_all:
@@ -239,6 +314,16 @@ def main():
     ap.add_argument('--gif', action='store_true', help='把推論過程（每趟一格）輸出成動畫 GIF，存到 output_dir/<名>_process.gif')
     ap.add_argument('--gif_fps', type=float, default=2.0, help='GIF 播放速率（格/秒）')
     ap.add_argument('--gif_max', type=int, default=512, help='GIF 影格長邊上限（縮圖控制檔案大小；0=不縮）')
+    ap.add_argument('--orient_blend', type=float, default=0.0,
+                    help='[方向引導] 結構張量沿邊方向混入 theta 的比例（0=關閉，0.5~0.8=推薦）。'
+                         '不需重訓，讓筆觸沿樹皮/毛髮方向走。')
+    ap.add_argument('--no_letterbox', action='store_true',
+                    help='不保持原始比例（直接拉成正方形，舊行為）。預設保持比例並補黑邊。')
+    ap.add_argument('--min_scale', type=float, default=0.0,
+                    help='[筆觸下限] scale 下限（0=可到最小筆觸界）。點狀筆觸優先加 passes 解決，非拉高此值。')
+    ap.add_argument('--ramp_frac', type=float, default=0.5,
+                    help='[單解析度模式 --levels 1] scale 由粗漸細所佔 pass 比例，複製 cute_ala_500 機制。'
+                         '搭配 --levels 1 --passes 200~500 使用。')
     args = ap.parse_args()
 
     device = torch.device('cuda:%d' % args.gpu if torch.cuda.is_available() else 'cpu')
@@ -267,9 +352,15 @@ def main():
     meta_brushes = stroke_render.load_meta_brushes(args.brush_dir, device, real_brush=args.real_brush)
 
     R = args.res
-    img = base.read_img(args.input, 'RGB', R, R).to(device)   # 直接縮到 R×R 方形
-    print('輸入 %s → (1,3,%d,%d)，金字塔 levels=%d、每層 passes=%d，N=%d'
-          % (args.input, R, R, args.levels, args.passes, args.queries))
+    if args.smoke or args.no_letterbox:
+        img = base.read_img(args.input, 'RGB', R, R).to(device)
+        crop_box = None
+    else:
+        img, crop_box = _load_letterbox(args.input, R)
+        img = img.to(device)
+    print('輸入 %s → (1,3,%d,%d)，金字塔 levels=%d、每層 passes=%d，N=%d%s'
+          % (args.input, R, R, args.levels, args.passes, args.queries,
+             '' if (args.smoke or args.no_letterbox) else '（letterbox 保持比例）'))
 
     gif_path = None
     if args.gif:
@@ -279,7 +370,14 @@ def main():
     canvas = paint(net, img, R, args.levels, args.passes, meta_brushes, args.real_brush, args.curved, args.chunk,
                    keep_all=args.keep_all, decision_thresh=args.decision_thresh,
                    soft_decision=args.soft_decision, stop_delta=args.stop_delta,
-                   gif_path=gif_path, gif_fps=args.gif_fps, gif_max=(args.gif_max or None))
+                   gif_path=gif_path, gif_fps=args.gif_fps, gif_max=(args.gif_max or None),
+                   orient_blend=args.orient_blend, min_scale=args.min_scale,
+                   ramp_frac=args.ramp_frac)
+
+    # letterbox 裁回原始比例（去掉黑邊）
+    if crop_box is not None:
+        y1, x1, y2, x2 = crop_box
+        canvas = canvas[:, :, y1:y2, x1:x2]
 
     os.makedirs(args.output_dir, exist_ok=True)
     if args.out_name:
