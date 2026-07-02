@@ -30,8 +30,13 @@ import stroke_render
 import inference as base  # 借用 read_img / save_img
 
 
-def _load_letterbox(path, res):
+def _load_letterbox(path, res, pad_mode='replicate'):
     """載圖並 letterbox-pad 成 res×res 正方形（保持原始比例，不拉伸）。
+
+    pad_mode='replicate'（預設）：用**邊緣色延伸**補邊條，不是純黑。
+        原因：純黑補邊時模型把黑邊當目標 → 在上下狂下黑大筆、且邊界粗筆跨越黑邊/內容
+        把黑帶進真實畫面（GIF 觀察）。replicate 讓邊條≈相鄰內容色 → 邊界筆觸不再帶黑，
+        邊條在裁切後丟棄。'black' 保留舊行為（除錯用）。
 
     Returns:
         img  : (1,3,res,res) tensor in [0,1]
@@ -42,18 +47,24 @@ def _load_letterbox(path, res):
     scale = res / max(orig_w, orig_h)
     new_w, new_h = round(orig_w * scale), round(orig_h * scale)
     img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
-    pad = Image.new('RGB', (res, res), (0, 0, 0))
     off_x, off_y = (res - new_w) // 2, (res - new_h) // 2
-    pad.paste(img_pil, (off_x, off_y))
-    img = torch.from_numpy(np.array(pad).transpose(2, 0, 1)).float().unsqueeze(0) / 255.
+    core = torch.from_numpy(np.array(img_pil).transpose(2, 0, 1)).float().unsqueeze(0) / 255.
+    pad_l, pad_r = off_x, res - new_w - off_x
+    pad_t, pad_b = off_y, res - new_h - off_y
+    if pad_mode == 'black':
+        img = F.pad(core, (pad_l, pad_r, pad_t, pad_b), mode='constant', value=0.0)
+    else:                                            # replicate：邊緣色延伸（消除黑邊污染）
+        img = F.pad(core, (pad_l, pad_r, pad_t, pad_b), mode='replicate')
     return img, (off_y, off_x, off_y + new_h, off_x + new_w)
 
 
 def _orient_field(img):
-    """計算每個像素的沿邊方向 theta ∈ [0,1]（0=水平、0.5=垂直）。
+    """結構張量求每像素「沿邊方向 theta ∈ [0,1]」與「邊強度 coherence ∈ [0,1]」。
 
-    用結構張量（Sobel + 局部平均）求主要邊緣方向，可引導筆觸沿著樹皮/毛髮走。
-    img: (1,3,H,W)  →  (1,1,H,W)
+    theta：0=水平、0.5=垂直（沿邊 = 梯度垂直方向），引導筆觸沿輪廓/毛髮走。
+    coherence = (λ1−λ2)/(λ1+λ2)：強且方向明確的邊（如前景/背景輪廓）→ 接近 1；
+                平坦或雜訊區 → 接近 0。用來「只在強邊」引導方向、不動平坦區。
+    img: (1,3,H,W)  →  (theta (1,1,H,W), coherence (1,1,H,W))
     """
     gray = img.mean(dim=1, keepdim=True)
     device, dtype = img.device, img.dtype
@@ -63,30 +74,44 @@ def _orient_field(img):
                       device=device, dtype=dtype).view(1, 1, 3, 3) / 8.0
     gx = F.conv2d(gray, kx, padding=1)
     gy = F.conv2d(gray, ky, padding=1)
-    # 局部平均結構張量分量（9×9 窗口）
-    J11 = F.avg_pool2d(gx * gx, 9, stride=1, padding=4)
+    J11 = F.avg_pool2d(gx * gx, 9, stride=1, padding=4)      # 局部平均結構張量（9×9）
     J12 = F.avg_pool2d(gx * gy, 9, stride=1, padding=4)
     J22 = F.avg_pool2d(gy * gy, 9, stride=1, padding=4)
-    # 梯度方向（垂直於邊緣）→ 沿邊方向 = 梯度 + π/2
     theta_grad = 0.5 * torch.atan2(2 * J12, J11 - J22 + 1e-8)
-    return ((theta_grad + math.pi / 2) % math.pi) / math.pi  # (1,1,H,W) ∈ [0,1]
+    theta = ((theta_grad + math.pi / 2) % math.pi) / math.pi  # 沿邊方向 [0,1]
+    aniso = torch.sqrt((J11 - J22) ** 2 + 4 * J12 * J12)      # λ1−λ2
+    coherence = aniso / (J11 + J22 + 1e-6)                    # ∈ [0,1]，強邊→1
+    return theta, coherence
 
 
-def _apply_orient(img, param, blend):
-    """把結構張量沿邊方向混入預測的 theta（param[:,:,4]）。
+def _apply_orient(img, param, strength, edge_gate=True):
+    """把沿邊方向混入預測 theta（param[:,:,4]），修邊界毛躁。
 
-    blend=0.0 → 純模型預測；blend=1.0 → 完全跟邊緣方向；建議 0.5~0.8。
+    strength   : 對齊強度 0~1。
+    edge_gate  : True（預設）→ 每筆混合量 = strength × 該處 coherence，**只在強邊**對齊、
+                 平坦區完全不動（解輪廓毛躁的正解，不會像全域對齊那樣把平坦筆觸弄斷）；
+                 False → 全域一律 strength（舊行為，易把平坦區弄糟）。
+    角度用圓形混合（雙倍角向量內插）→ 避免 0/π 環繞時混錯方向。
     """
-    if blend <= 0.0:
+    if strength <= 0.0:
         return param
-    orient = _orient_field(img)                               # (1,1,H,W)
+    theta, coh = _orient_field(img)                          # (1,1,H,W) ×2
     xc, yc = param[:, :, 0], param[:, :, 1]                  # (1,N)
     grid = torch.stack([xc * 2 - 1, yc * 2 - 1], dim=-1).unsqueeze(2)  # (1,N,1,2)
-    sampled = F.grid_sample(orient, grid, align_corners=False,
-                            mode='bilinear', padding_mode='border')      # (1,1,N,1)
-    sampled = sampled.squeeze(1).squeeze(-1)                  # (1,N)
+
+    def _samp(f):
+        return F.grid_sample(f, grid, align_corners=False,
+                             mode='bilinear', padding_mode='border').squeeze(1).squeeze(-1)  # (1,N)
+    t_edge = _samp(theta)                                     # 沿邊方向 [0,1]
+    b = strength * (_samp(coh).clamp(0, 1) if edge_gate else torch.ones_like(t_edge))  # (1,N) 每筆混合量
+    t_model = param[:, :, 4]                                  # 模型預測方向 [0,1]
+    # 圓形混合：θ∈[0,1]→角度 πθ，方向無向性（π 週期）→ 用雙倍角向量內插
+    am, ae = t_model * (2 * math.pi), t_edge * (2 * math.pi)  # 2θ·π
+    vx = (1 - b) * torch.cos(am) + b * torch.cos(ae)
+    vy = (1 - b) * torch.sin(am) + b * torch.sin(ae)
+    t_new = (0.5 * torch.atan2(vy, vx)) % math.pi / math.pi   # 回 [0,1]
     param = param.clone()
-    param[:, :, 4] = (1.0 - blend) * param[:, :, 4] + blend * sampled
+    param[:, :, 4] = t_new
     return param
 
 
@@ -165,7 +190,8 @@ def render_strokes_global(param, H, W, meta_brushes, real_brush, curved):
 def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, chunk,
          keep_all=False, decision_thresh=0.0, soft_decision=False, stop_delta=0.0015,
          gif_path=None, gif_fps=2, gif_max=512, orient_blend=0.0, blur_init=False,
-         blur_sigma=16, min_scale=0.0, ramp_frac=0.5):
+         blur_sigma=16, min_scale=0.0, ramp_frac=0.5, underpaint_passes=0,
+         orient_edge_gate=True):
     """[金字塔] 全域 coarse-to-fine：低解析度起步、逐層升 res，每層在殘差上補筆精修。
 
     每層**全域**（整張圖一次 forward、無 patch、無棋盤 → 去格保住）；逐層升解析度 → 高層看
@@ -180,6 +206,8 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
     ramp_frac: [單解析度模式，levels==1] scale 由粗漸細所佔的 pass 比例（前 ramp_frac 趟 1.0→min_scale、
                之後停在 min_scale 繼續精修）。levels==1 才生效，複製 cute_ala_500 的「單解析度 + 數百趟
                回饋精修」機制：一路穿過粗鋪底 → 逐趟在殘差上補更小筆 → 累積出細節。levels>1 = 金字塔模式。
+    underpaint_passes: [打底層] 開始精修前，先用**最粗尺度 + 全覆蓋**（keep_all）鋪 N 趟色塊底
+               （像人畫畫先構圖上大色塊）。整張先被色底鋪滿 → 無黑洞、精修殘差集中在細節/邊緣。0=關閉。
     """
     device = img_full.device
     res_list = [max(R // (2 ** (levels - 1 - i)), 64) for i in range(levels)]
@@ -191,8 +219,49 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
         return _to_pil(c, gif_max)
     frames = [gframe(canvas)] if gif_path else None
 
+    def _render_pass(canvas, img_L, res, scale, force_cover):
+        """一趟：net 預測 N 筆 → 依 decision 合成到 canvas。回傳 (canvas, logit, kept)。
+        force_cover=True → 無視 decision 全畫（打底層用，確保整張鋪滿）。"""
+        cha = img_L - canvas
+        param, decision, _ = net(img_L, canvas, cha, scale=scale)
+        if orient_blend > 0.0:
+            param = _apply_orient(img_L, param, orient_blend, edge_gate=orient_edge_gate)
+        N, d = param.shape[1], param.shape[2]
+        if force_cover or keep_all:
+            dec = torch.ones(1, N, 1, 1, 1, device=device)
+        elif soft_decision:
+            dec = torch.sigmoid(decision).view(1, N, 1, 1, 1)
+        else:
+            dec = (decision > decision_thresh).float().view(1, N, 1, 1, 1)
+        kept = float(dec.sum().item())
+        for s in range(0, N, chunk):                 # 分塊渲染省顯存
+            e = min(s + chunk, N)
+            sub = param[:, s:e].reshape(-1, d).contiguous()
+            fg, al = render_strokes_global(sub, res, res, meta_brushes, real_brush, curved)
+            fg = F.max_pool2d(fg, 3, stride=1, padding=1)
+            al = -F.max_pool2d(-al, 3, stride=1, padding=1)
+            cs = e - s
+            fg = fg.view(1, cs, 3, res, res)
+            al = al.view(1, cs, 3, res, res)
+            alpha = al * dec[:, s:e]
+            canvas = _composite_over(canvas, fg, alpha)
+        return canvas, decision.view(1, N), kept
+
     single_scale = (levels == 1)                     # [參考機制] 單解析度 + scale 隨 pass ramp
     ramp_end = max(1, int(passes * ramp_frac))       #   前 ramp_frac 趟粗→細，之後停在 min_scale
+
+    # [打底層] 構圖上大色塊：最粗尺度 + 全覆蓋，鋪 underpaint_passes 趟 → 整張有色底、無黑洞。
+    if underpaint_passes > 0:
+        res0 = res_list[0]
+        img0 = F.interpolate(img_full, (res0, res0), mode='area') if res0 < R else img_full
+        for up in range(underpaint_passes):
+            canvas, logit, kept = _render_pass(canvas, img0, res0, scale=1.0, force_cover=True)
+            resid = (img0 - canvas).abs().mean().item()
+            print('  [打底 %d/%d] res%d 尺度 1.00 | 全覆蓋 %.0f 筆 | 殘差 %.4f'
+                  % (up + 1, underpaint_passes, res0, kept, resid))
+            if frames is not None:
+                frames.append(gframe(canvas))
+
     for li, res in enumerate(res_list):
         img_L = F.interpolate(img_full, (res, res), mode='area') if res < R else img_full
         if canvas.shape[-1] != res:                  # 上層結果升採樣帶到本層
@@ -205,34 +274,11 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
                 raw = raw_level
             scale = min_scale + (1.0 - min_scale) * raw  # [筆觸下限] 收在 min_scale 不歸 0
             prev = canvas
-            cha = img_L - canvas
-            resid = cha.abs().mean().item()
-            param, decision, _ = net(img_L, canvas, cha, scale=scale)
-            if orient_blend > 0.0:
-                param = _apply_orient(img_L, param, orient_blend)
-            N, d = param.shape[1], param.shape[2]
-            logit = decision.view(1, N)
-            if keep_all:
-                dec = torch.ones(1, N, 1, 1, 1, device=device)
-            elif soft_decision:
-                dec = torch.sigmoid(decision).view(1, N, 1, 1, 1)
-            else:
-                dec = (decision > decision_thresh).float().view(1, N, 1, 1, 1)
-            kept = float(dec.sum().item())
-            for s in range(0, N, chunk):             # 分塊渲染省顯存（在本層 res 上渲染）
-                e = min(s + chunk, N)
-                sub = param[:, s:e].reshape(-1, d).contiguous()
-                fg, al = render_strokes_global(sub, res, res, meta_brushes, real_brush, curved)
-                fg = F.max_pool2d(fg, 3, stride=1, padding=1)
-                al = -F.max_pool2d(-al, 3, stride=1, padding=1)
-                cs = e - s
-                fg = fg.view(1, cs, 3, res, res)
-                al = al.view(1, cs, 3, res, res)
-                alpha = al * dec[:, s:e]
-                canvas = _composite_over(canvas, fg, alpha)
+            resid = (img_L - canvas).abs().mean().item()
+            canvas, logit, kept = _render_pass(canvas, img_L, res, scale, force_cover=False)
             delta = (canvas - prev).abs().mean().item()
             print('  L%d/%d res%d pass%d/%d：尺度 %.2f | 有效筆數 %.0f/%d | logit %.2f/%.2f/%.2f | 殘差 %.4f | 變化 %.4f'
-                  % (li + 1, levels, res, p + 1, passes, scale, kept, N,
+                  % (li + 1, levels, res, p + 1, passes, scale, kept, logit.shape[1],
                      logit.min(), logit.mean(), logit.max(), resid, delta))
             if frames is not None:
                 frames.append(gframe(canvas))
@@ -315,15 +361,24 @@ def main():
     ap.add_argument('--gif_fps', type=float, default=2.0, help='GIF 播放速率（格/秒）')
     ap.add_argument('--gif_max', type=int, default=512, help='GIF 影格長邊上限（縮圖控制檔案大小；0=不縮）')
     ap.add_argument('--orient_blend', type=float, default=0.0,
-                    help='[方向引導] 結構張量沿邊方向混入 theta 的比例（0=關閉，0.5~0.8=推薦）。'
-                         '不需重訓，讓筆觸沿樹皮/毛髮方向走。')
+                    help='[方向引導/修邊界毛躁] 沿邊方向對齊強度（0=關閉，0.4~0.7 推薦）。'
+                         '預設「邊強度加權」：只在強邊（前景/背景輪廓）讓筆觸沿輪廓走→修毛邊，'
+                         '平坦區不動。不需重訓。')
+    ap.add_argument('--orient_global', action='store_true',
+                    help='[除錯] 關掉邊強度加權，改全域一律對齊（易把平坦區弄糟，一般別開）。')
     ap.add_argument('--no_letterbox', action='store_true',
-                    help='不保持原始比例（直接拉成正方形，舊行為）。預設保持比例並補黑邊。')
+                    help='不保持原始比例（直接拉成正方形，舊行為）。預設保持比例並邊緣延伸補邊。')
+    ap.add_argument('--pad_mode', default='replicate', choices=['replicate', 'black'],
+                    help='letterbox 補邊方式：replicate=邊緣色延伸（預設，消除黑邊被畫成黑筆污染內容）；'
+                         'black=純黑（舊行為，會有黑邊污染問題）。')
     ap.add_argument('--min_scale', type=float, default=0.0,
                     help='[筆觸下限] scale 下限（0=可到最小筆觸界）。點狀筆觸優先加 passes 解決，非拉高此值。')
     ap.add_argument('--ramp_frac', type=float, default=0.5,
                     help='[單解析度模式 --levels 1] scale 由粗漸細所佔 pass 比例，複製 cute_ala_500 機制。'
                          '搭配 --levels 1 --passes 200~500 使用。')
+    ap.add_argument('--underpaint_passes', type=int, default=0,
+                    help='[打底層] 精修前先用最粗尺度+全覆蓋鋪 N 趟色塊底（構圖上大色塊）→ 無黑洞、精修更集中。'
+                         '建議 2~4。0=關閉。')
     args = ap.parse_args()
 
     device = torch.device('cuda:%d' % args.gpu if torch.cuda.is_available() else 'cpu')
@@ -356,7 +411,7 @@ def main():
         img = base.read_img(args.input, 'RGB', R, R).to(device)
         crop_box = None
     else:
-        img, crop_box = _load_letterbox(args.input, R)
+        img, crop_box = _load_letterbox(args.input, R, pad_mode=args.pad_mode)
         img = img.to(device)
     print('輸入 %s → (1,3,%d,%d)，金字塔 levels=%d、每層 passes=%d，N=%d%s'
           % (args.input, R, R, args.levels, args.passes, args.queries,
@@ -372,7 +427,8 @@ def main():
                    soft_decision=args.soft_decision, stop_delta=args.stop_delta,
                    gif_path=gif_path, gif_fps=args.gif_fps, gif_max=(args.gif_max or None),
                    orient_blend=args.orient_blend, min_scale=args.min_scale,
-                   ramp_frac=args.ramp_frac)
+                   ramp_frac=args.ramp_frac, underpaint_passes=args.underpaint_passes,
+                   orient_edge_gate=not args.orient_global)
 
     # letterbox 裁回原始比例（去掉黑邊）
     if crop_box is not None:
