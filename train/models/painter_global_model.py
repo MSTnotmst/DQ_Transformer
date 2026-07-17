@@ -91,6 +91,28 @@ class PainterGlobalModel(PainterModel):
         parser.add_argument('--lambda_edge', type=float, default=0.0,
                             help='[細節][實驗，預設關] 邊緣加權 L1：weight=1+λ·|∇target|。本意是放大高對比邊緣的損失逼模型'
                                  '重建眼/鼻，但實測會讓模型在邊緣丟深色雜斑（單色大筆畫不出乾淨輪廓）→ 預設 0 關閉')
+        parser.add_argument('--lambda_resid_dec', type=float, default=1.0,
+                            help='[殘差門控/防瘋狂疊補] 懲罰權重（v4 雙邊 hinge）：殘差小處開筆罰'
+                                 '（壓向 logit≤-1）、殘差大處拒畫也罰（推向 logit≥+1）→ decision = 殘差分類器，'
+                                 '兩方向恆定梯度、無飽和死點。v1 乘 sigmoid（正飽和死，踩坑 #19）、'
+                                 'v3 單邊 hinge（負飽和死，踩坑 #20）皆廢。0=關閉（舊行為）')
+        parser.add_argument('--resid_tau_rel', type=float, default=1.0,
+                            help='[殘差門控] 懲罰的殘差基準：τ = 此值 × 該張當前平均殘差。局部殘差 ≥ τ 零懲罰、'
+                                 '低於 τ 線性加重。相對值 → 早 step（滿畫布殘差）自然全放行鋪底、'
+                                 '晚 step 自動收緊，形成先鋪底後精修的課程')
+        parser.add_argument('--resid_tau_abs', type=float, default=0.02,
+                            help='[殘差門控 v3] τ 的絕對下限：τ = max(resid_tau_rel×當前平均殘差, 此值)。'
+                                 '堵「殘差均勻化 → τ 跟著縮 → 永遠零懲罰」的漏洞，深收斂態（課程輪）'
+                                 '仍保持關筆壓力。0=關（v2 行為）')
+        parser.add_argument('--conv_curriculum', type=float, default=0.5,
+                            help='[收斂態課程/根治後期疊補] 每輪以此機率改從「半收斂畫布」（模糊目標，'
+                                 '模擬推論已跑數百趟、殘差只剩細節的狀態）起步、K 步全在 R 細尺度，'
+                                 '而非空白金字塔。訓練從未見過推論後期狀態，是 decision 後期不再關筆'
+                                 '（resid2 kept 卡 280/400 不續降）的根因。0=關（v2 行為）')
+        parser.add_argument('--conv_warm_epochs', type=int, default=30,
+                            help='[收斂態課程] 前 N epoch 把課程機率從 0 線性 ramp 到 conv_curriculum：'
+                                 '先學會空白起步的基本功再教收斂態關筆——半收斂畫布+殘差懲罰對未成熟'
+                                 '模型有壓成全負的塌縮風險（本專案塌縮史 #7/#11/#13）')
         return parser
 
     def __init__(self, opt):
@@ -121,6 +143,13 @@ class PainterGlobalModel(PainterModel):
         self.lambda_anchor = float(getattr(opt, 'lambda_anchor', 4.0))
         # [細節] 邊緣加權 L1 強度（預設 0=純 L1；實測 >0 會在邊緣產生深色雜斑，見 modify_commandline_options）。
         self.lambda_edge = float(getattr(opt, 'lambda_edge', 0.0))
+        # [殘差門控] 過畫懲罰：opacity × relu(1 − 局部殘差/τ)，τ = resid_tau_rel × 當前平均殘差。
+        self.lambda_resid_dec = float(getattr(opt, 'lambda_resid_dec', 1.0))
+        self.resid_tau_rel = float(getattr(opt, 'resid_tau_rel', 1.0))
+        self.resid_tau_abs = float(getattr(opt, 'resid_tau_abs', 0.02))
+        # [收斂態課程] 半收斂畫布起步的機率與 warm-up epoch 數。
+        self.conv_curriculum = float(getattr(opt, 'conv_curriculum', 0.5))
+        self.conv_warm_epochs = int(getattr(opt, 'conv_warm_epochs', 30))
 
         # --- 全域超參 ---
         self.R = opt.global_res
@@ -235,9 +264,28 @@ class PainterGlobalModel(PainterModel):
             return [self.R] * self.K
         return [max(self.R // (2 ** (self.K - 1 - k)), 64) for k in range(self.K)]
 
+    def _stroke_resid(self, cha, param, pool_frac=32):
+        """[殘差門控] 每筆筆畫中心的局部平均殘差 (b,N)，與 inference_global._stroke_resid 同式。
+
+        cha: (b,3,R,R) 目標 − 畫布（本身無梯度）。殘差圖先用 ~R/pool_frac 視窗平滑，
+        量「這一帶」的誤差。曲筆中心取貝茲 t=0.5 點；直筆取 (xc,yc)。
+        注意 grid_sample 對取樣座標可微 → 懲罰的梯度會把筆畫座標推向高殘差區（有益副作用）。
+        """
+        err = cha.abs().mean(dim=1, keepdim=True)                 # (b,1,R,R)
+        k = max(3, (err.shape[-1] // pool_frac) | 1)              # 奇數視窗
+        err = F.avg_pool2d(err, k, stride=1, padding=k // 2)
+        if self.curved:
+            xc = 0.25 * param[:, :, 0] + 0.5 * param[:, :, 2] + 0.25 * param[:, :, 4]
+            yc = 0.25 * param[:, :, 1] + 0.5 * param[:, :, 3] + 0.25 * param[:, :, 5]
+        else:
+            xc, yc = param[:, :, 0], param[:, :, 1]
+        grid = torch.stack([xc * 2 - 1, yc * 2 - 1], dim=-1).unsqueeze(2)  # (b,N,1,2)
+        return F.grid_sample(err, grid, align_corners=False, mode='bilinear',
+                             padding_mode='border').squeeze(1).squeeze(-1)  # (b,N)
+
     def _paint_step(self, target, canvas_in, scale=0.0):
         """一步：net 看 (target, canvas_in, cha) → 預測 N 筆、分塊合成到 canvas_in。
-        canvas_in 須已 detach（每步獨立）。回傳 (canvas_out, decision_logits (b,N), loss_anchor)。
+        canvas_in 須已 detach（每步獨立）。回傳 (canvas_out, decision_logits (b,N), loss_anchor, loss_resid)。
         **渲染解析度取 canvas_in 的空間大小**（金字塔每層 res 不同；筆觸是正規化座標，任意 res 皆可渲染）。
 
         loss_anchor = |pred_xy − 自己的動態錨點|（dq_query 才有；否則 0）。它給每個 query
@@ -253,6 +301,25 @@ class PainterGlobalModel(PainterModel):
             loss_anchor = torch.zeros((), device=canvas_in.device)
         # [路2] 軟決策：用 sigmoid 當每筆不透明度（連續、梯度平滑），避免硬閾值 + 稀疏懲罰把 decision 塌縮成全負。
         dec = torch.sigmoid(decisions.view(b, self.N, 1, 1, 1).contiguous())
+        # [殘差門控 v4] 雙邊 hinge，decision 直接學成「殘差分類器」（兩方向都恆定梯度、皆打 raw logit）：
+        #   關筆邊：relu(logit+1) × relu(1 − e/τ)   —— 殘差已小處開著要罰，壓向 logit ≤ -1
+        #   開筆邊：relu(1 − logit) × min(relu(e/τ−1), 1) —— 殘差夠大處拒畫也要罰，推向 logit ≥ +1
+        # 歷史（單邊都死過，方向相反）：v1 懲罰乘 sigmoid → pixel loss（恆定）把 logit 推進**正**飽和區，
+        # 懲罰梯度 ≈0 拉不回（400 全開，踩坑 #19）。v3 單邊 hinge（恆定）+ 課程火力 → 把 logit 拖進**負**
+        # 飽和區，pixel loss 上拉力要過 sigmoid'≈0 → 「全不畫」死點（pass1 殘差 0.184 就 kept=0，踩坑 #20）。
+        # 教訓：恆定梯度 vs 會飽和的對手，誰恆定誰贏、贏了就死在飽和區——兩邊都恆定才有平衡點。
+        # 推論 thresh 0 恰在兩 margin 中間。τ = max(rel×當前平均殘差, abs 下限) 不變。
+        if self.lambda_resid_dec > 0:
+            e = self._stroke_resid(cha, param)                   # (b,N) 局部殘差
+            tau = (self.resid_tau_rel * cha.abs().mean(dim=(1, 2, 3), keepdim=False)
+                   ).clamp_min(max(self.resid_tau_abs, 1e-6)).unsqueeze(1)  # (b,1)；abs 下限堵均勻化漏洞
+            r = e / tau                                          # (b,N) 局部殘差相對 τ（>1=值得畫）
+            logit = decisions.view(b, self.N)
+            close_h = (logit + 1.0).clamp(min=0) * (1.0 - r).clamp(min=0)          # 過畫懲罰
+            open_h = (1.0 - logit).clamp(min=0) * (r - 1.0).clamp(min=0, max=1.0)  # 拒畫懲罰（e 項封頂防爆）
+            loss_resid = (close_h + open_h).mean()
+        else:
+            loss_resid = torch.zeros((), device=canvas_in.device)
         chunk = getattr(self.opt, 'render_chunk', 32)
         canvas = canvas_in
         for s in range(0, self.N, chunk):
@@ -265,7 +332,7 @@ class PainterGlobalModel(PainterModel):
             al = al.view(b, cs, 3, R, R)
             alpha = al * dec[:, s:e]                             # (b,cs,3,R,R)，含 decision 閘
             canvas = _composite_over(canvas, fg, alpha)         # 向量化合成
-        return canvas, decisions.view(b, self.N), loss_anchor
+        return canvas, decisions.view(b, self.N), loss_anchor, loss_resid
 
     @torch.no_grad()
     def _edge_weight(self, target):
@@ -302,42 +369,68 @@ class PainterGlobalModel(PainterModel):
                 target_L = F.interpolate(self.target, (res, res), mode='area')
                 if canvas.shape[-1] != res:
                     canvas = F.interpolate(canvas, (res, res), mode='bilinear', align_corners=False)
-                canvas, _, _ = self._paint_step(target_L, canvas, scale=self._step_scale(k))
+                canvas, _, _, _ = self._paint_step(target_L, canvas, scale=self._step_scale(k))
             self.rec = canvas if canvas.shape[-1] == self.R else \
                 F.interpolate(canvas, (self.R, self.R), mode='bilinear', align_corners=False)
 
     def optimize_parameters(self, epoch):
         """[金字塔 + 路2] 低解析度空白起步，逐層升 res，在自己的(detached)畫布上補 K 層，
         每層 pixel loss 拉近「該層解析度的目標」、立即 backward（記憶體=單層；低層便宜、峰值=最高層）。
-        模型因此學會『先在低 res 粗鋪、升 res 後在殘差上補細節』——複製原 patch 版金字塔準確度，但每層全域。"""
+        模型因此學會『先在低 res 粗鋪、升 res 後在殘差上補細節』——複製原 patch 版金字塔準確度，但每層全域。
+
+        [收斂態課程 v3] 以 p 機率（epoch ramp）改走「半收斂起步」輪：畫布 = 模糊目標（proxy——無筆觸
+        紋理但殘差分布對：集中在細節處），K 步全在 R、定細尺度，模擬推論 ramp 後段的定尺度精修。
+        空白金字塔輪教「怎麼畫」，課程輪教「什麼時候該停」——推論後期狀態訓練從未見過，是 decision
+        後期不再關筆（resid2 kept 卡 280/400）的根因。⚠️ 課程輪 self.rec 起點就近似目標，
+        visdom 圖突然變好 ≠ 模型變強，看損失要分輪型。"""
         self.optimizer.zero_grad()
-        res_list = self._pyramid_res()
         b = self.target.shape[0]
-        canvas = torch.zeros(b, 3, res_list[0], res_list[0], device=self.device)
+        p_cur = self.conv_curriculum * min(1.0, epoch / max(1, self.conv_warm_epochs))
+        if p_cur > 0 and float(torch.rand(())) < p_cur:
+            # f 越小 = 越接近畫完。scale 與 f **獨立**隨機取樣——v3 把細尺度跟 f=4（該收工的畫布）
+            # 綁死，模型學到「尺度細=無條件收工」捷徑（resid3 推論 scale 歸零後殘差 0.184 仍 kept=0，
+            # logit 全負）。解耦後 decision 只能靠殘差判斷關不關；「粗尺度疊半收斂畫布」推論本就會出現。
+            f = (4, 8, 16)[int(torch.randint(0, 3, (1,)))]
+            low = max(self.R // f, 8)
+            canvas = F.interpolate(F.interpolate(self.target, (low, low), mode='area'),
+                                   (self.R, self.R), mode='bilinear', align_corners=False)
+            res_list = [self.R] * self.K
+            scale_fix = float(torch.rand(()))
+        else:
+            res_list = self._pyramid_res()
+            canvas = torch.zeros(b, 3, res_list[0], res_list[0], device=self.device)
+            scale_fix = None                                # 金字塔輪照舊用 _step_scale
         last_pixel = torch.tensor(0., device=self.device)
         last_anchor = torch.tensor(0., device=self.device)
+        last_resid = torch.tensor(0., device=self.device)
         for k, res in enumerate(res_list):
             target_L = F.interpolate(self.target, (res, res), mode='area')      # 該層解析度的目標
             if canvas.shape[-1] != res:
                 canvas = F.interpolate(canvas, (res, res), mode='bilinear', align_corners=False)  # 上層結果升採樣帶上來
             canvas_in = canvas.detach()                     # 每層以 detach 畫布為輸入（單層圖）
-            canvas, _, loss_anchor = self._paint_step(target_L, canvas_in, scale=self._step_scale(k))
-            # pixel 重建（軟決策不透明度由 pixel loss 自然學）+ 錨點定位損失（防 query 置換對稱塌縮）。
+            canvas, _, loss_anchor, loss_resid = self._paint_step(
+                target_L, canvas_in, scale=self._step_scale(k) if scale_fix is None else scale_fix)
+            # pixel 重建（軟決策不透明度由 pixel loss 自然學）+ 錨點定位損失（防 query 置換對稱塌縮）
+            # + 殘差門控過畫懲罰（誤差小處下筆付費 → 只在差異大處畫）。
             if self.lambda_edge > 0:
                 w = F.interpolate(self.edge_w, (res, res), mode='area')
                 loss_pixel = ((canvas - target_L).abs() * w).mean()
             else:
                 loss_pixel = (canvas - target_L).abs().mean()
-            loss_k = loss_pixel * self.opt.lambda_pixel + loss_anchor * self.lambda_anchor
+            loss_k = (loss_pixel * self.opt.lambda_pixel + loss_anchor * self.lambda_anchor
+                      + loss_resid * self.lambda_resid_dec)
             loss_k.backward()                               # 立即 backward 釋放本層圖
             last_pixel = loss_pixel.detach()
             last_anchor = loss_anchor.detach()
+            last_resid = loss_resid.detach()
             canvas = canvas.detach()
         self.optimizer.step()
         self.rec = canvas
-        # 損失記錄（路2 用 pixel + anchor；其餘軸設 0）
+        # 損失記錄（路2 用 pixel + anchor + resid-decision；其餘軸設 0）
         self.loss_pixel = last_pixel
         self.loss_anchor = last_anchor
-        self.loss_G = last_pixel * self.opt.lambda_pixel + last_anchor * self.lambda_anchor
-        for n in ['gt', 'w', 'decision', 'decision_sum', 'gan', 'D_fake', 'D_real', 'D']:
+        self.loss_decision = last_resid                     # [殘差門控] 借 decision 軸記錄過畫懲罰
+        self.loss_G = (last_pixel * self.opt.lambda_pixel + last_anchor * self.lambda_anchor
+                       + last_resid * self.lambda_resid_dec)
+        for n in ['gt', 'w', 'decision_sum', 'gan', 'D_fake', 'D_real', 'D']:
             setattr(self, 'loss_' + n, torch.tensor(0., device=self.device))

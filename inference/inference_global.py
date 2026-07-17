@@ -84,26 +84,33 @@ def _orient_field(img):
     return theta, coherence
 
 
-def _apply_orient(img, param, strength, edge_gate=True):
+def _apply_orient(img, param, strength, edge_gate=True, theta_field=None, strength_field=None):
     """把沿邊方向混入預測 theta（param[:,:,4]），修邊界毛躁。
 
     strength   : 對齊強度 0~1。
     edge_gate  : True（預設）→ 每筆混合量 = strength × 該處 coherence，**只在強邊**對齊、
                  平坦區完全不動（解輪廓毛躁的正解，不會像全域對齊那樣把平坦筆觸弄斷）；
                  False → 全域一律 strength（舊行為，易把平坦區弄糟）。
+    theta_field/strength_field : [語意分區] 給定時改用預算好的**逐區朝向場/強度場**（由
+                 _region_orient_fields 產生，已含 orient_blend 與逐區 strength、跨界羽化）；
+                 此時忽略 edge_gate 與 img 的即時結構張量。不給則走上述現行每像素路徑。
     角度用圓形混合（雙倍角向量內插）→ 避免 0/π 環繞時混錯方向。
     """
     if strength <= 0.0:
         return param
-    theta, coh = _orient_field(img)                          # (1,1,H,W) ×2
     xc, yc = param[:, :, 0], param[:, :, 1]                  # (1,N)
     grid = torch.stack([xc * 2 - 1, yc * 2 - 1], dim=-1).unsqueeze(2)  # (1,N,1,2)
 
     def _samp(f):
         return F.grid_sample(f, grid, align_corners=False,
                              mode='bilinear', padding_mode='border').squeeze(1).squeeze(-1)  # (1,N)
-    t_edge = _samp(theta)                                     # 沿邊方向 [0,1]
-    b = strength * (_samp(coh).clamp(0, 1) if edge_gate else torch.ones_like(t_edge))  # (1,N) 每筆混合量
+    if theta_field is not None:                              # [語意分區] 逐區場已算好，直接取樣
+        t_edge = _samp(theta_field)                          # 逐區朝向 [0,1]
+        b = _samp(strength_field).clamp(0, 1)                # 逐區混合量（已含 strength）
+    else:
+        theta, coh = _orient_field(img)                      # (1,1,H,W) ×2
+        t_edge = _samp(theta)                                # 沿邊方向 [0,1]
+        b = strength * (_samp(coh).clamp(0, 1) if edge_gate else torch.ones_like(t_edge))  # (1,N)
     t_model = param[:, :, 4]                                  # 模型預測方向 [0,1]
     # 圓形混合：θ∈[0,1]→角度 πθ，方向無向性（π 週期）→ 用雙倍角向量內插
     am, ae = t_model * (2 * math.pi), t_edge * (2 * math.pi)  # 2θ·π
@@ -113,6 +120,204 @@ def _apply_orient(img, param, strength, edge_gate=True):
     param = param.clone()
     param[:, :, 4] = t_new
     return param
+
+
+def _gauss_blur(x, sigma):
+    """(1,1,H,W) 可分離高斯模糊，供逐區場跨界羽化（消區界接縫）。"""
+    r = max(1, int(round(3 * sigma)))
+    xs = torch.arange(-r, r + 1, device=x.device, dtype=x.dtype)
+    ker = torch.exp(-(xs ** 2) / (2 * sigma * sigma))
+    ker = ker / ker.sum()
+    x = F.conv2d(x, ker.view(1, 1, 1, -1), padding=(0, r))
+    x = F.conv2d(x, ker.view(1, 1, -1, 1), padding=(r, 0))
+    return x
+
+
+def _pca(x, dim=32):
+    """(N,C) → (N,dim) 主成分投影（去均值 + SVD 取前 dim 個右奇異向量）。"""
+    x = x - x.mean(0, keepdim=True)
+    dim = min(dim, x.shape[1])
+    _, _, vh = torch.linalg.svd(x, full_matrices=False)      # vh:(k,C)
+    return x @ vh[:dim].T
+
+
+def _kmeans_torch(x, k, iters=25, seed=0):
+    """(N,C) 純 torch Lloyd K-means（免 sklearn）。回傳 (labels(N,), centroids(k,C))。"""
+    n = x.shape[0]
+    k = min(k, n)
+    g = torch.Generator(device='cpu').manual_seed(seed)      # 固定 seed → 分區不跳動
+    cen = x[torch.randperm(n, generator=g)[:k].to(x.device)].clone()
+    lab = torch.zeros(n, dtype=torch.long, device=x.device)
+    for _ in range(iters):
+        lab = torch.cdist(x, cen).argmin(1)
+        for j in range(k):
+            m = lab == j
+            if m.any():
+                cen[j] = x[m].mean(0)
+    return lab, cen
+
+
+def _merge_clusters(lab, cen, mfrac=0.35):
+    """併掉「質心距離 < mfrac × 質心間平均距離」的 cluster（呼應原文合併低差異區）+ 壓實標籤。
+
+    用相對距離而非 cosine：cosine 對非負特徵（如 RGB+xy）恆偏高會把全部併成一區；
+    相對距離門檻只併真正相近的質心，過度合併時退化為「不併」而非「併成一區」。
+    """
+    k = cen.shape[0]
+    if k <= 1:
+        return lab
+    d = torch.cdist(cen, cen)                                # (k,k)
+    off = d[~torch.eye(k, dtype=torch.bool, device=d.device)]
+    ref = float(off.mean()) + 1e-6
+    parent = list(range(k))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    for i in range(k):
+        for j in range(i + 1, k):
+            if float(d[i, j]) < mfrac * ref:
+                parent[find(i)] = find(j)
+    uniq = sorted({find(c) for c in range(k)})
+    comp = {r: i for i, r in enumerate(uniq)}
+    out = lab.clone()
+    for c in range(k):
+        out[lab == c] = comp[find(c)]
+    return out
+
+
+def _mode_filter(lab, win):
+    """(1,1,H,W) long → win×win 多數決濾波：去孤立點、平滑區界（呼應原文去孤立點）。"""
+    L = int(lab.max().item()) + 1
+    oh = F.one_hot(lab[:, 0], L).permute(0, 3, 1, 2).float()  # (1,L,H,W)
+    oh = F.avg_pool2d(oh, win, stride=1, padding=win // 2)
+    return oh.argmax(1, keepdim=True)
+
+
+_DINO = {}
+
+
+def _dino_model(device):
+    """快取 DINOv2 (vits14)。首次需 torch.hub 下載權重（cglab/WSL2 有網路時）。"""
+    if 'm' not in _DINO:
+        m = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        _DINO['m'] = m.eval().to(device)
+    return _DINO['m']
+
+
+def _dino_patch_features(img, device):
+    """DINOv2 patch 特徵 (Np,C) + 網格尺寸 (gh,gw)。img:(1,3,H,W)∈[0,1]。"""
+    m = _dino_model(device)
+    side = max(14, (img.shape[-1] // 14) * 14)               # 縮到 14 的倍數
+    x = F.interpolate(img, (side, side), mode='bilinear', align_corners=False)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    with torch.no_grad():
+        f = m.forward_features((x - mean) / std)['x_norm_patchtokens'][0]  # (Np,C)
+    return f, side // 14, side // 14
+
+
+def _color_features(img, grid=64, pos_w=2.0):
+    """[fallback] RGB + 正規化 xy 位置特徵，供無 DINOv2 時的簡易分區。"""
+    x = F.interpolate(img, (grid, grid), mode='area')[0]     # (3,g,g)
+    ys, xs = torch.meshgrid(torch.linspace(0, 1, grid, device=img.device),
+                            torch.linspace(0, 1, grid, device=img.device), indexing='ij')
+    feat = torch.cat([x.reshape(3, -1).T, xs.reshape(-1, 1), ys.reshape(-1, 1)], dim=1)  # (g*g, 5)
+    feat = (feat - feat.mean(0, keepdim=True)) / (feat.std(0, keepdim=True) + 1e-6)      # 各維可比
+    feat[:, 3:] *= pos_w                                      # 位置權重（>1 更依空間相鄰成區）
+    return feat, grid, grid
+
+
+def _semantic_regions(img, k=6, feature='dino', seed=0):
+    """[語意分區] target → region label map (1,1,H,W) long。
+
+    feature='dino'：DINOv2 patch 特徵 → PCA → K-means → 合併相似區 → 去孤立點；
+    'color' 或 DINOv2 載入失敗 → RGB+xy 簡易分區（fallback）。整張只算一次（cache 在呼叫端）。
+    """
+    device = img.device
+    feat = gh = gw = None
+    if feature == 'dino':
+        try:
+            feat, gh, gw = _dino_patch_features(img, device)
+            feat = _pca(feat, 32)
+        except Exception as ex:                              # noqa: BLE001
+            print('  [分區] DINOv2 載入失敗（%s）→ 回退 color' % ex)
+            feat = None
+    if feat is None:
+        feat, gh, gw = _color_features(img)
+    lab, cen = _kmeans_torch(feat, k, seed=seed)
+    lab = _merge_clusters(lab, cen).view(1, 1, gh, gw).float()
+    H = img.shape[-1]
+    lab = F.interpolate(lab, (H, H), mode='nearest').long()  # 網格標籤 → 全解析度
+    return _mode_filter(lab, win=max(3, (H // 64) | 1))
+
+
+def _region_orient_fields(img, label, strength, feather):
+    """[語意分區] 由 target 與 region label 算出逐區「朝向場 theta_t、強度場 smap」(1,1,H,W)。
+
+    - 強邊處跟本地邊方向、平坦區跟該區主方向（去平坦區方向抖動 → 修毛邊，不弄斷平坦筆觸）；
+    - 逐區 strength = orient_blend × 該區平均邊強度（天空等平坦區自動低、毛髮/衣褶自動高）；
+    - 雙倍角向量 + 強度場一起高斯羽化 → 消區界接縫。
+    """
+    theta, coh = _orient_field(img)                          # (1,1,H,W) ×2
+    a = theta * (2 * math.pi)
+    vx_l, vy_l = torch.cos(a), torch.sin(a)                  # 本地邊雙倍角向量
+    L = int(label.max().item()) + 1
+    vx_r = torch.zeros_like(vx_l)
+    vy_r = torch.zeros_like(vy_l)
+    smap = torch.zeros_like(coh)
+    for j in range(L):
+        m = (label == j).float()
+        denom = m.sum() + 1e-6
+        w = m * coh
+        sw = w.sum() + 1e-6
+        vx_r = vx_r + m * ((w * vx_l).sum() / sw)            # 區主方向（coherence 加權）
+        vy_r = vy_r + m * ((w * vy_l).sum() / sw)
+        smap = smap + m * ((m * coh).sum() / denom)          # 區平均邊強度 → 逐區 strength
+    vx = coh * vx_l + (1 - coh) * vx_r                       # 強邊跟本地、平坦跟區主方向
+    vy = coh * vy_l + (1 - coh) * vy_r
+    smap = strength * smap
+    if feather and feather > 0:
+        vx, vy, smap = _gauss_blur(vx, feather), _gauss_blur(vy, feather), _gauss_blur(smap, feather)
+    theta_t = ((0.5 * torch.atan2(vy, vx)) % math.pi) / math.pi
+    return theta_t, smap.clamp(0, 1)
+
+
+def _save_region_png(img, label, path):
+    """把 region label 上色疊在 target 上存 PNG（診斷分區是否合理，走 chat/ 截圖流程）。"""
+    L = int(label.max().item()) + 1
+    g = torch.Generator().manual_seed(0)
+    palette = torch.rand(L, 3, generator=g).to(label.device)     # 固定配色
+    col = palette[label[0, 0].long()]                            # (H,W,3)
+    over = 0.5 * img[0].permute(1, 2, 0) + 0.5 * col
+    arr = (over.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    Image.fromarray(arr).save(path)
+    print('  [分區] 已存分區可視化：%s（%d 區）' % (path, L))
+
+
+def _stroke_resid(cha, param, curved, pool_frac=32):
+    """[殘差門控] 取每筆筆畫中心的「局部平均殘差」(1,N)，供只在差異大處下筆。
+
+    cha    : (1,3,H,W) 目標 − 畫布。
+    param  : (1,N,d)。直筆中心 = (param[..,0], param[..,1])；曲筆（貝茲三控制點）
+             取曲線 t=0.5 點 = 0.25·p0 + 0.5·p1 + 0.25·p2。
+    殘差圖先用 ~res/pool_frac 的視窗平滑 → 量的是「這一帶」的誤差，不是單一像素，
+    避免筆畫中心恰好落在已畫好的像素上就被誤殺。
+    """
+    err = cha.abs().mean(dim=1, keepdim=True)                 # (1,1,H,W)
+    k = max(3, (err.shape[-1] // pool_frac) | 1)              # 奇數視窗
+    err = F.avg_pool2d(err, k, stride=1, padding=k // 2)
+    if curved:
+        xc = 0.25 * param[:, :, 0] + 0.5 * param[:, :, 2] + 0.25 * param[:, :, 4]
+        yc = 0.25 * param[:, :, 1] + 0.5 * param[:, :, 3] + 0.25 * param[:, :, 5]
+    else:
+        xc, yc = param[:, :, 0], param[:, :, 1]
+    grid = torch.stack([xc * 2 - 1, yc * 2 - 1], dim=-1).unsqueeze(2)  # (1,N,1,2)
+    return F.grid_sample(err, grid, align_corners=False, mode='bilinear',
+                         padding_mode='border').squeeze(1).squeeze(-1)  # (1,N)
 
 
 def _to_pil(canvas, max_side=None):
@@ -191,7 +396,9 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
          keep_all=False, decision_thresh=0.0, soft_decision=False, stop_delta=0.0015,
          gif_path=None, gif_fps=2, gif_max=512, orient_blend=0.0, blur_init=False,
          blur_sigma=16, min_scale=0.0, ramp_frac=0.5, underpaint_passes=0,
-         orient_edge_gate=True):
+         orient_edge_gate=True, resid_gate=0.0, resid_gate_rel=False, topk=0,
+         semantic_regions=False, region_k=6, region_feature='dino', region_smooth=6.0,
+         region_seed=0, region_png=None):
     """[金字塔] 全域 coarse-to-fine：低解析度起步、逐層升 res，每層在殘差上補筆精修。
 
     每層**全域**（整張圖一次 forward、無 patch、無棋盤 → 去格保住）；逐層升解析度 → 高層看
@@ -208,10 +415,34 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
                回饋精修」機制：一路穿過粗鋪底 → 逐趟在殘差上補更小筆 → 累積出細節。levels>1 = 金字塔模式。
     underpaint_passes: [打底層] 開始精修前，先用**最粗尺度 + 全覆蓋**（keep_all）鋪 N 趟色塊底
                （像人畫畫先構圖上大色塊）。整張先被色底鋪滿 → 無黑洞、精修殘差集中在細節/邊緣。0=關閉。
+    resid_gate: [殘差門控] 只在差異大的地方下筆：每筆取中心局部平均殘差，低於門檻的筆直接跳過
+               （alpha 歸 0）→ 已畫好的區域不再瘋狂疊補，筆數集中在殘差最大處。0=關閉。
+               打底層（force_cover）不受影響；與 keep_all / soft_decision 正交（先算 decision 再乘 gate）。
+    resid_gate_rel: True → 門檻改為「resid_gate × 當前畫面平均殘差」：>1 只畫比平均差的區域，
+               門檻隨收斂自動變嚴，各 pass 免手調絕對值。
+    topk     : [筆數預算] 過完 decision（與 resid_gate）的筆再按「筆心局部殘差」排序，每趟只畫
+               前 topk 名（0=關閉，全畫）。收斂後期高殘差點變少 → 實際下筆數自動遞減、
+               已畫好區域擠不進前幾名 → 「不是過門檻就畫，只畫最值得畫的」。打底層不受影響。
+               soft_decision 模式下排序鍵為 殘差×不透明度。
     """
     device = img_full.device
     res_list = [max(R // (2 ** (levels - 1 - i)), 64) for i in range(levels)]
     canvas = torch.zeros(1, 3, res_list[0], res_list[0], device=device)
+
+    # [語意分區] 整張只算一次 region label；逐 res 的朝向/強度場 lazy 快取（跨 pass 不變）。
+    region_label = None
+    _orient_cache = {}
+    if semantic_regions and orient_blend > 0.0:
+        region_label = _semantic_regions(img_full, k=region_k, feature=region_feature, seed=region_seed)
+        if region_png:
+            _save_region_png(img_full, region_label, region_png)
+
+    def _orient_fields_for(img_L):
+        r = img_L.shape[-1]
+        if r not in _orient_cache:
+            lab = F.interpolate(region_label.float(), (r, r), mode='nearest').long()
+            _orient_cache[r] = _region_orient_fields(img_L, lab, orient_blend, region_smooth)
+        return _orient_cache[r]
 
     def gframe(c):                                   # GIF 影格：統一升到 R 再縮，避免各層尺寸不一
         if c.shape[-1] != R:
@@ -225,7 +456,11 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
         cha = img_L - canvas
         param, decision, _ = net(img_L, canvas, cha, scale=scale)
         if orient_blend > 0.0:
-            param = _apply_orient(img_L, param, orient_blend, edge_gate=orient_edge_gate)
+            if region_label is not None:                     # [語意分區] 用逐區朝向場/強度場
+                tf, sf = _orient_fields_for(img_L)
+                param = _apply_orient(img_L, param, orient_blend, theta_field=tf, strength_field=sf)
+            else:
+                param = _apply_orient(img_L, param, orient_blend, edge_gate=orient_edge_gate)
         N, d = param.shape[1], param.shape[2]
         if force_cover or keep_all:
             dec = torch.ones(1, N, 1, 1, 1, device=device)
@@ -233,6 +468,17 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
             dec = torch.sigmoid(decision).view(1, N, 1, 1, 1)
         else:
             dec = (decision > decision_thresh).float().view(1, N, 1, 1, 1)
+        if resid_gate > 0.0 and not force_cover:             # [殘差門控] 誤差小的地方不下筆
+            e = _stroke_resid(cha, param, curved)            # (1,N) 每筆中心局部殘差
+            t = resid_gate * float(cha.abs().mean().item()) if resid_gate_rel else resid_gate
+            dec = dec * (e >= t).float().view(1, N, 1, 1, 1)
+        if topk > 0 and not force_cover:                     # [筆數預算] 存活筆按殘差只取前 k 名
+            e = _stroke_resid(cha, param, curved)            # (1,N)
+            score = e.view(-1) * dec.view(-1)                # 被 decision/gate 關掉的筆不參賽
+            if int((score > 0).sum().item()) > topk:
+                mask = torch.zeros(N, device=device)
+                mask[score.topk(topk).indices] = 1.0
+                dec = dec * mask.view(1, N, 1, 1, 1)
         kept = float(dec.sum().item())
         for s in range(0, N, chunk):                 # 分塊渲染省顯存
             e = min(s + chunk, N)
@@ -301,7 +547,7 @@ def paint(net, img_full, R, levels, passes, meta_brushes, real_brush, curved, ch
 def paint_to_file(model_path, input_path, out_path, res=512, queries=400, hidden=256,
                   num_blocks=3, extra_down=2, dq_query=True, real_brush=False, curved=False,
                   brush_dir='brush', passes=4, levels=4, min_kept=8, stop_delta=0.0015, chunk=32, gpu=0,
-                  soft_decision=False):
+                  soft_decision=False, resid_gate=0.0, resid_gate_rel=False):
     """程式化呼叫：載入 PainterGlobal、金字塔逐層精修出圖、存到 out_path。
 
     供 eval_quality.py 等共用，等同 CLI 但可直接傳參。回傳 out_path。
@@ -320,7 +566,8 @@ def paint_to_file(model_path, input_path, out_path, res=512, queries=400, hidden
     meta_brushes = stroke_render.load_meta_brushes(brush_dir, device, real_brush=real_brush)
     img = base.read_img(input_path, 'RGB', res, res).to(device)
     canvas = paint(net, img, res, levels, passes, meta_brushes, real_brush, curved, chunk,
-                   stop_delta=stop_delta, soft_decision=soft_decision)
+                   stop_delta=stop_delta, soft_decision=soft_decision,
+                   resid_gate=resid_gate, resid_gate_rel=resid_gate_rel)
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     base.save_img(canvas[0], out_path)
     return out_path
@@ -376,9 +623,31 @@ def main():
     ap.add_argument('--ramp_frac', type=float, default=0.5,
                     help='[單解析度模式 --levels 1] scale 由粗漸細所佔 pass 比例，複製 cute_ala_500 機制。'
                          '搭配 --levels 1 --passes 200~500 使用。')
+    ap.add_argument('--resid_gate', type=float, default=0.0,
+                    help='[殘差門控/防瘋狂疊補] 只在差異大的地方下筆：每筆取中心局部平均殘差，'
+                         '低於門檻直接跳過。0=關閉。絕對門檻建議 0.03~0.08；'
+                         '搭 --resid_gate_rel 時為「平均殘差的倍數」（建議 1.0~2.0），隨收斂自動變嚴。'
+                         '打底層（--underpaint_passes）不受影響。免重訓。')
+    ap.add_argument('--resid_gate_rel', action='store_true',
+                    help='[殘差門控] 門檻改為相對值：resid_gate × 當前畫面平均殘差。'
+                         '>1 = 只畫比平均更差的區域，各 pass 免手調絕對門檻。')
+    ap.add_argument('--topk', type=int, default=0,
+                    help='[筆數預算/免重訓] 過完 decision（與 resid_gate）的筆按筆心局部殘差排序，'
+                         '每趟只畫前 k 名——不是過門檻就畫，只畫最值得畫的。收斂後期下筆數自動遞減。'
+                         '建議 80~150（passes 可能要加，同筆數分更多趟下）。0=關閉。打底層不受影響。')
     ap.add_argument('--underpaint_passes', type=int, default=0,
                     help='[打底層] 精修前先用最粗尺度+全覆蓋鋪 N 趟色塊底（構圖上大色塊）→ 無黑洞、精修更集中。'
                          '建議 2~4。0=關閉。')
+    ap.add_argument('--semantic_regions', action='store_true',
+                    help='[語意分區/借鏡 StyleGallery，免重訓] 把 --orient_blend 從全域升級成逐語意區：'
+                         '先把 target 分成語意區，各區用自己的主方向與 strength 對齊筆觸（天空自動弱、'
+                         '毛髮/衣褶自動強）。需搭 --orient_blend>0。0=關（走現行全域每像素路徑）。')
+    ap.add_argument('--region_k', type=int, default=6, help='[語意分區] K-means 分區數上限（建議 4~6）。')
+    ap.add_argument('--region_feature', default='dino', choices=['dino', 'color'],
+                    help='[語意分區] 分區特徵：dino=DINOv2 語意（首次需下載權重）；color=RGB+xy（零依賴 fallback）。')
+    ap.add_argument('--region_smooth', type=float, default=6.0,
+                    help='[語意分區] 區界羽化高斯 sigma（消區界接縫；0=不羽化，硬邊可能出接縫）。')
+    ap.add_argument('--region_seed', type=int, default=0, help='[語意分區] K-means 初始化 seed（固定→分區不跳動）。')
     args = ap.parse_args()
 
     device = torch.device('cuda:%d' % args.gpu if torch.cuda.is_available() else 'cpu')
@@ -417,10 +686,9 @@ def main():
           % (args.input, R, R, args.levels, args.passes, args.queries,
              '' if (args.smoke or args.no_letterbox) else '（letterbox 保持比例）'))
 
-    gif_path = None
-    if args.gif:
-        stem = os.path.splitext(args.out_name)[0] if args.out_name else os.path.splitext(os.path.basename(args.input))[0]
-        gif_path = os.path.join(args.output_dir, stem + '_process.gif')
+    stem = os.path.splitext(args.out_name)[0] if args.out_name else os.path.splitext(os.path.basename(args.input))[0]
+    gif_path = os.path.join(args.output_dir, stem + '_process.gif') if args.gif else None
+    region_png = os.path.join(args.output_dir, stem + '_regions.png') if args.semantic_regions else None
 
     canvas = paint(net, img, R, args.levels, args.passes, meta_brushes, args.real_brush, args.curved, args.chunk,
                    keep_all=args.keep_all, decision_thresh=args.decision_thresh,
@@ -428,7 +696,12 @@ def main():
                    gif_path=gif_path, gif_fps=args.gif_fps, gif_max=(args.gif_max or None),
                    orient_blend=args.orient_blend, min_scale=args.min_scale,
                    ramp_frac=args.ramp_frac, underpaint_passes=args.underpaint_passes,
-                   orient_edge_gate=not args.orient_global)
+                   orient_edge_gate=not args.orient_global,
+                   resid_gate=args.resid_gate, resid_gate_rel=args.resid_gate_rel,
+                   topk=args.topk,
+                   semantic_regions=args.semantic_regions, region_k=args.region_k,
+                   region_feature=args.region_feature, region_smooth=args.region_smooth,
+                   region_seed=args.region_seed, region_png=region_png)
 
     # letterbox 裁回原始比例（去掉黑邊）
     if crop_box is not None:
